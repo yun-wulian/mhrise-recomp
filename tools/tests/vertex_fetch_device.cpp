@@ -145,22 +145,30 @@ bool pan() {
     printf("panning cutout, depth prepass + EQUAL, 3 implicit mip levels: %u / %u mismatches\n", bad, 48 * 256);
     return bad == 0;
 }
-// VERTEX_OVERLAY: compile vertex_overlay.comp in addition to the vertex fetch shaders.
-bool overlay_windows(Program& paint, const cmd::SetRenderTargets& target, void* texture) {
-    Program writer;
-    auto& cs = writer.stages.emplace_back();
-    std::ifstream file("vertex_overlay.comp.spv", std::ios::binary | std::ios::ate);
+// For the read-only consumer, compile vertex_overlay.comp with -DREAD_REMAP as vertex_remap.comp.spv.
+bool add_compute(Program& program, const char* path, std::initializer_list<nvnshader::Resource> resources) {
+    auto& cs = program.stages.emplace_back();
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     const auto size = file.tellg();
     if (size <= 0 || size % 4) return false;
     cs.shader.spirv.resize(size / 4);
     if (!file.seekg(0).read(reinterpret_cast<char*>(cs.shader.spirv.data()), size)) return false;
     cs.shader.stage = nvnshader::Stage::Compute;
-    nvnshader::Resource storage{nvnshader::Resource::StorageBuffer, 0, 0, 0x310, 0};
-    storage.is_written = true;
-    cs.shader.resources.push_back(storage);
+    cs.shader.resources = resources;
     cs.tried = true;
     cs.spirv_id = spirv_identity(cs.shader);
-    if (create_shader_module(vk()->device, cs.shader.spirv, &cs.module) != VK_SUCCESS) return false;
+    return create_shader_module(vk()->device, cs.shader.spirv, &cs.module) == VK_SUCCESS;
+}
+
+bool overlay_windows(Program& paint, const cmd::SetRenderTargets& target, void* texture) {
+    Program writer, reader;
+    nvnshader::Resource storage{nvnshader::Resource::StorageBuffer, 0, 0, 0x310, 0};
+    storage.is_written = true;
+    if (!add_compute(writer, "vertex_overlay.comp.spv", {storage})) return false;
+    nvnshader::Resource output{nvnshader::Resource::StorageBuffer, 1, 0, 0x320, 0};
+    output.is_written = true;
+    storage.is_written = false;
+    if (!add_compute(reader, "vertex_remap.comp.spv", {storage, output})) return false;
 
     constexpr unsigned stride = 256;
     alignas(256) std::array<uint8_t, 4096> ring{};
@@ -249,6 +257,97 @@ bool overlay_windows(Program& paint, const cmd::SetRenderTargets& target, void* 
     const auto mismatches = pixels.size() - std::count(pixels.begin(), pixels.end(), gpu_value);
     printf("compute subrange after neighbouring CPU write: %zu/%zu pixels incorrect\n", mismatches, pixels.size());
     bad += mismatches;
+
+    // A remap upload starts inside a GPU-written region and extends into guest memory.
+    // Reading it must not turn the guest-owned tail into part of the source overlay.
+    alignas(256) std::array<uint32_t, 1163 + 64> upload;
+    alignas(256) std::array<uint32_t, 1163> remap{};
+    for (unsigned i = 0; i < upload.size(); ++i) upload[i] = i;
+    const uint64_t upload_addr = reinterpret_cast<uintptr_t>(upload.data());
+    const uint64_t remap_addr = reinterpret_cast<uintptr_t>(remap.data());
+    CommandList produce, transfer;
+    produce.commands = {cmd::BindProgram{&writer, 32}, cmd::BindStorageBuffer{5, 0, {upload_addr, 512}},
+                        cmd::Dispatch{128, 1, 1}, cmd::Barrier{~0}};
+    transfer.commands = {cmd::CopyBuffer{upload_addr + 256, remap_addr, sizeof(remap)}, target,
+                         cmd::Viewport{0, 0, 0, 16, 8}, cmd::Scissor{0, 0, 0, 8, 8},
+                         cmd::BindProgram{&paint, 3}, cmd::BindVertexAttribs{{attrs, 5, no_spill}},
+                         cmd::BindVertexStreams{{&stream, 1, no_spill}}};
+    for (unsigned half = 0; half < 2; ++half) {
+        const BufferRange chunk{remap_addr + half * 256, 3 * sizeof(Words)};
+        transfer.commands.emplace_back(cmd::Scissor{0, int(half * 8), 0, 8, 8});
+        transfer.commands.emplace_back(cmd::BindVertexBuffers{0, {&chunk, 1, no_spill}});
+        transfer.commands.emplace_back(cmd::Draw{4, -1, 3, 0, 0, 0, 0, 1});
+    }
+    transfer.commands.emplace_back(cmd::SetRenderTargets{});
+    execute({&produce, &transfer});
+    wait_idle();
+    nvnTextureReadTexels(texture, nullptr, &all, pixels.data());
+    unsigned copy_errors = 0;
+    for (unsigned i = 0; i < pixels.size(); ++i) {
+        const bool gpu = i % 16 < 8;
+        for (unsigned c = 0; c < 4; ++c)
+            copy_errors += pixels[i][c] != (((gpu ? 64u : 128u) + c) ^ (gpu ? 0x13579bdfu : 0u));
+    }
+    printf("mixed-source remap copy: %u incorrect channels\n", copy_errors);
+    bad += copy_errors;
+
+    // A later upload uses the same GPU-produced prefix, with new indices in the CPU tail.
+    // Merging the source on the first copy made a CPU tail update discard that prefix.
+    upload[128] = 37;
+    execute({&transfer});
+    wait_idle();
+    nvnTextureReadTexels(texture, nullptr, &all, pixels.data());
+    unsigned repeat_bad = 0;
+    for (unsigned i = 0; i < pixels.size(); ++i)
+        for (unsigned c = 0; c < 4; ++c) {
+            const unsigned word = i % 16 < 8 ? ((64u + c) ^ 0x13579bdfu) : upload[128 + c];
+            repeat_bad += pixels[i][c] != word;
+        }
+    printf("remap re-upload after CPU tail update: %u incorrect channels\n", repeat_bad);
+    bad += repeat_bad;
+
+    // Repeat through a read-only compute descriptor without copying the table first.
+    // The second dispatch must see a CPU tail update and the original GPU prefix together.
+    CommandList consume;
+    consume.commands = {cmd::BindProgram{&reader, 32},
+                        cmd::BindStorageBuffer{5, 0, {upload_addr + 256, sizeof(remap)}},
+                        cmd::BindStorageBuffer{5, 1, {remap_addr, sizeof(remap)}},
+                        cmd::Dispatch{int(remap.size()), 1, 1}, cmd::Barrier{~0}};
+    consume.commands.insert(consume.commands.end(), transfer.commands.begin() + 1, transfer.commands.end());
+    // Reinitialize both owners so the compute case does not inherit the copy case's result.
+    for (unsigned i = 0; i < 128; ++i) upload[i] = 0x800000u + i;
+    execute({&produce, &consume});
+    wait_idle();
+    upload[128] = 41;
+    execute({&consume});
+    wait_idle();
+    nvnTextureReadTexels(texture, nullptr, &all, pixels.data());
+    unsigned compute_bad = 0;
+    for (unsigned i = 0; i < pixels.size(); ++i)
+        for (unsigned c = 0; c < 4; ++c) {
+            const unsigned word = i % 16 < 8 ? (upload[64 + c] ^ 0x13579bdfu) : upload[128 + c];
+            compute_bad += pixels[i][c] != (word & 0x3fffffu);
+        }
+    printf("read-only remap after CPU tail update: %u incorrect channels\n", compute_bad);
+    bad += compute_bad;
+
+    // The destination overlay needs 256 bytes of headroom. Exercise a legal upload
+    // that fits in one read snapshot but is too large for that destination slot.
+    constexpr size_t large_words = ((16u << 20) - 128) / sizeof(uint32_t);
+    std::vector<uint32_t> large_src(large_words + 128, 123), large_dst(large_words);
+    const auto large_base = (reinterpret_cast<uintptr_t>(large_src.data()) + 255) & ~uintptr_t{255};
+    CommandList large;
+    large.commands = {cmd::BindProgram{&writer, 32}, cmd::BindStorageBuffer{5, 0, {large_base, 512}},
+                      cmd::Dispatch{128, 1, 1}, cmd::Barrier{~0},
+                      cmd::CopyBuffer{large_base + 256, reinterpret_cast<uintptr_t>(large_dst.data()),
+                                      large_words * sizeof(uint32_t)}};
+    execute({&large});
+    wait_idle();
+    unsigned large_bad = 0;
+    for (size_t i = 0; i < large_dst.size(); ++i)
+        large_bad += large_dst[i] != (i < 64 ? (123u ^ 0x13579bdfu) : 123u);
+    printf("large mixed-source copy: %u incorrect words\n", large_bad);
+    bad += large_bad;
     return bad == 0;
 }
 } // namespace

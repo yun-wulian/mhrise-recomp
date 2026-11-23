@@ -1376,6 +1376,7 @@ private:
         const char* from = "";
         uint32_t words = 0;  // cuántas palabras suyas se registran
         VkDescriptorBufferInfo bound{};  // lo que se enlazó (para volcar lo que ve la GPU: los espejos no están mapeados)
+        const uint8_t* snapshot = nullptr;
     };
     bool read_after_dumped_ = false;  // ya se volcaron las entradas del primer dispatch que dejó NaN
     void dump_gpu_buffer(const VkDescriptorBufferInfo& b, uint64_t size, const std::string& file);
@@ -2296,7 +2297,7 @@ private:
     void prepare_draw_overlays();
     // Lo mismo antes de los descriptores de un dispatch: una unión en su bucle tiraría el overlay al que apunta el
     // descriptor ya grabado de otro SSBO del mismo dispatch (lo que escribiera ahí se perdería).
-    void prepare_dispatch_overlays();
+    uint32_t prepare_dispatch_overlays();
     void wb_reference(uint64_t address, uint64_t size);  // con wb_mutex_
     // CopyBuffer/ClearBuffer/UpdateBuffer de la CPU: el overlay que contiene entero [address, address+size) y sigue al
     // día con la memoria del juego (mirado ANTES de escribirla), o overlays_.end().
@@ -2310,7 +2311,8 @@ private:
     std::vector<uint64_t> overlays_before_cpu_write(uint64_t address, uint64_t size);
     void cpu_wrote_partial(const std::vector<uint64_t>& kept, uint64_t address, uint64_t size);
     // CopyBuffer cuyo origen está en un overlay: copia en la GPU a un overlay del destino.
-    bool copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size);
+    enum class BufferCopySource { Guest, Snapshot, Copied, Error };
+    BufferCopySource copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size, std::vector<uint8_t>& snapshot);
     Staging::Alloc alloc_read_snapshot(uint64_t address, uint64_t size);
     bool read_vertex_stream(BufferRange range, bool allow_mirror, VkBuffer& buffer, VkDeviceSize& offset, bool& gpu_vertices);
     // Called outside the pass. A null buffer on success means the CPU owns the entire range.
@@ -3909,13 +3911,22 @@ void Executor::apply(const Command& c) {
                             (unsigned long long)v.size);
                 // Si el origen lo escribió la GPU (overlay), la copia se hace en la GPU: p. ej. NieR copia el número
                 // de balas que cuenta un compute al instanceCount de un draw indirecto.
-                if (copy_from_overlay(v.src, v.dst, v.size)) {
+                if (!v.size || v.src == v.dst) return;
+                std::vector<uint8_t> snapshot;
+                const auto source = copy_from_overlay(v.src, v.dst, v.size, snapshot);
+                if (source == BufferCopySource::Error) {
+                    NVN_LOG("CopyBuffer failed: %#llx -> %#llx (%llu bytes)\n", (unsigned long long)v.src,
+                            (unsigned long long)v.dst, (unsigned long long)v.size);
+                    cpu_publication_ok_ = false;
+                    return;
+                }
+                if (source == BufferCopySource::Copied) {
                     copied_.clear();
                     return;
                 }
                 // Los buffers son memoria del juego: la copia de la GPU es una copia de memoria aquí (y, si cae entera
                 // dentro de un overlay, también en él: patch_overlay).
-                if (vigilar_nan_) {  // DEPURACIÓN: ¿había algo de la GPU en el origen que no se copia?
+                if (vigilar_nan_ && source == BufferCopySource::Guest) {  // DEPURACIÓN
                     char b[96];
                     snprintf(b, sizeof b, "CopyBuffer de la CPU a %#llx (%llu bytes)", static_cast<unsigned long long>(v.dst),
                              static_cast<unsigned long long>(v.size));
@@ -3925,7 +3936,8 @@ void Executor::apply(const Command& c) {
                 auto keep = overlay_containing(v.dst, v.size);  // antes de escribir: ¿sigue valiendo?
                 const std::vector<uint64_t> partial =
                     keep == overlays_.end() ? overlays_before_cpu_write(v.dst, v.size) : std::vector<uint64_t>{};
-                memmove(reinterpret_cast<void*>(v.dst), reinterpret_cast<const void*>(v.src), v.size);
+                const void* bytes = source == BufferCopySource::Snapshot ? snapshot.data() : reinterpret_cast<const void*>(v.src);
+                memmove(reinterpret_cast<void*>(v.dst), bytes, v.size);
                 cpu_wrote_mirrors(v.dst, v.size);
                 if (keep != overlays_.end()) {
                     patch_overlay(keep, v.dst, v.size);
@@ -8891,22 +8903,22 @@ const Executor::Overlay* Executor::find_overlay(uint64_t address, uint64_t size,
     return &o;
 }
 
-bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
+Executor::BufferCopySource Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size,
+                                                      std::vector<uint8_t>& snapshot) {
     VkDeviceSize src_offset = 0;
-    const Overlay* so = find_overlay(src, size, &src_offset);
-    // Origen escrito solo en parte por la GPU (o repartido en varios overlays): unido, se copia lo suyo y no la memoria
-    // del juego (la unión cierra el pase abierto, como la copia de abajo).
-    if (!so) {
-        if (vigilar_nan_) {  // DEPURACIÓN: quién crea la unión
-            char b[96];
-            snprintf(b, sizeof b, "CopyBuffer en la GPU: unión del origen %#llx, frame %llu", static_cast<unsigned long long>(src),
-                     static_cast<unsigned long long>(frame_));
-            writer_ = b;
-        }
-        so = merge_overlays(src, size, &src_offset, true);
+    VkBuffer src_buffer = VK_NULL_HANDLE;
+    const uint8_t* host = nullptr;
+    const bool overlap = (src < dst ? dst - src : src - dst) < size;
+    const Overlay* so = overlap ? nullptr : find_overlay(src, size, &src_offset);
+    if (so) {
+        src_buffer = so->buffer;
+        host = so->data + (src_offset - so->offset);
+    } else {
+        // Intersecting overlays can extend beyond either end of the source. Snapshot the
+        // exact bytes before allocating the destination, including GPU writes in this submit.
+        if (!gather_overlays(src, size, &src_buffer, &src_offset, &host)) return BufferCopySource::Error;
+        if (!src_buffer) return BufferCopySource::Guest;
     }
-    if (!so) return false;
-    const VkBuffer src_buffer = so->buffer;
     VkDeviceSize dst_offset = 0;
     if (vigilar_nan_) {  // DEPURACIÓN
         char b[96];
@@ -8915,7 +8927,26 @@ bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
         writer_ = b;
     }
     const Overlay* d = make_overlay(dst, size, &dst_offset);  // puede invalidar `so`: ya no se usa
-    if (!d) return false;
+    if (!d) {
+        // A large destination may not fit in the overlay arena. The CPU copy must still
+        // read the resolved source, whose allocation lives until this submission completes.
+        full_barrier();
+        VkMemoryBarrier visibility{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        visibility.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        visibility.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                             1, &visibility, 0, nullptr, 0, nullptr);
+        const auto previous = submitted_.load();
+        const VkFence fence = inflight_[cur_].fence;
+        splitting_ = true;
+        finish();
+        const bool ok = submitted_.load() != previous &&
+                        vkWaitForFences(vk()->device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        if (ok) snapshot.assign(host, host + size);
+        splitting_ = false;
+        begin();
+        return ok ? BufferCopySource::Snapshot : BufferCopySource::Error;
+    }
     note_gpu_write_vs_mirrors(dst, size, "CopyBuffer");
     if (vigilar_nan_) {  // DEPURACIÓN: el destino lo escribe la GPU (written/writers no se marcan aquí)
         auto it = overlays_.upper_bound(dst);
@@ -8957,7 +8988,7 @@ bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
                 any_cpu_reads_ = true;
             }
         }
-    return true;
+    return BufferCopySource::Copied;
 }
 
 void Executor::note_gpu_write_vs_mirrors(uint64_t address, uint64_t size, const char* what) {
@@ -9766,10 +9797,11 @@ static bool compute_binding_crosses(const StageBindings& bindings, const Program
 
 // Ver la declaración. Mismos rangos y tamaños que los descriptores del dispatch (los SSBO de la tabla de c0; los UBE son
 // uniform buffers aunque se lean como storage: no se unen).
-void Executor::prepare_dispatch_overlays() {
-    if (!keep_gpu_overlays_ || overlays_.empty()) return;
+uint32_t Executor::prepare_dispatch_overlays() {
+    if (!keep_gpu_overlays_ || overlays_.empty()) return 0;
     const StageBindings& sb = st_.bindings[static_cast<int>(Stage::Compute)];
     VkDeviceSize off = 0;
+    uint32_t snapshot_reads = 0;
     for (const Resource& r : st_.compute->shader.resources) {
         if (r.kind != Resource::StorageBuffer || r.cbuf_index != kComputeDriverBank || r.cbuf_offset < kComputeStorageBase)
             continue;
@@ -9786,10 +9818,26 @@ void Executor::prepare_dispatch_overlays() {
                 !compute_binding_crosses(sb, *st_.compute, {range.address, size}))
                 o = merge_overlays(range.address, size, &off, false);
             if (o || make_overlay(range.address, size, &off)) note_overlay_written(range.address, kWrittenByCompute);
-        } else if (!find_overlay(range.address, size, &off)) {
-            merge_overlays(range.address, size, &off, true);
+        } else if (!find_overlay(range.address, std::min<uint64_t>(range.size, vk()->props.limits.maxStorageBufferRange), &off)) {
+            const auto part = first_overlay_touching(range.address);
+            if (part == overlays_.end() || part->first >= range.address + range.size) continue;
+            // Aliases used by this dispatch must share a live backing. Other read-only
+            // windows (including the face normal remap) only need the bytes at this point.
+            const auto& resources = st_.compute->shader.resources;
+            const bool aliases_writer = std::any_of(resources.begin(), resources.end(), [&](const Resource& w) {
+                if (w.kind != Resource::StorageBuffer || !w.is_written || w.cbuf_index != kComputeDriverBank ||
+                    w.cbuf_offset < kComputeStorageBase) return false;
+                const uint32_t slot = (w.cbuf_offset - kComputeStorageBase) / 16;
+                if (slot >= kMaxStorage) return false;
+                const auto& other = sb.storage[slot];
+                return other.address && other.size && (range.address >= other.address ?
+                    range.address - other.address < other.size : other.address - range.address < range.size);
+            });
+            if (aliases_writer) merge_overlays(range.address, size, &off, true);
+            else snapshot_reads |= 1u << index;
         }
     }
+    return snapshot_reads;
 }
 
 // Ver la declaración. Antes de que la CPU escriba: los overlays que toca, con lo de la GPU y al día.
@@ -9893,7 +9941,7 @@ void Executor::read_after_dispatch(const ProgramStage& cs, uint32_t x, uint32_t 
                  static_cast<unsigned long long>(r.size), r.from);
         in += b;
         const uint64_t words = std::min<uint64_t>(r.size / 4, r.words);
-        const uint8_t* p = !r.address ? nullptr
+        const uint8_t* p = r.snapshot ? r.snapshot : !r.address ? nullptr
                            : strcmp(r.from, "overlay") == 0 ? gpu(r.address, words * 4)
                                                             : reinterpret_cast<const uint8_t*>(r.address);
         for (uint64_t i = 0; p && i < words; i++) {
@@ -10305,7 +10353,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     // Las uniones de overlays, antes de los descriptores (ver prepare_dispatch_overlays). Tras descartar los dispatch que
     // no se ejecutan (sin overlays para ellos) y con writer_ ya puesto (watch_nan). Los argumentos indirectos ya se
     // miraron: si una unión se traga su overlay, su hueco sigue intacto hasta que acabe este envío, y se leen antes.
-    prepare_dispatch_overlays();
+    const uint32_t snapshot_reads = prepare_dispatch_overlays();
     auto skipped = [&](const char* why) {  // DEPURACIÓN
         static int logged = 0;
         if (vigilar_nan_ && logged++ < 64) NVN_LOG("[vigía] dispatch descartado (%s): %s\n", why, writer_.c_str());
@@ -10406,11 +10454,16 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(limits.minUniformBufferOffsetAlignment, 16);
     const VkDeviceSize ssbo_align = std::max<VkDeviceSize>(limits.minStorageBufferOffsetAlignment, 16);
     std::vector<std::pair<uint64_t, uint64_t>> read_ranges;  // DEPURACIÓN (read_after_dispatch): overlays a leer
+    VkDescriptorBufferInfo face_remap{};
+    const bool trace_face_remap = full_trace_ && frame_ == trace_frame_ && cs->print == 0x525985a9ccdd7b21ULL;
+    const std::string remap_file = trace_face_remap ? "/storage/emulated/0/NieR-volcados/normal-remap-f" +
+        std::to_string(frame_) + "-cs" + std::to_string(dispatches_) : std::string{};
     std::vector<ReadInput> read_inputs;
     for (const Resource& r : cs->shader.resources) {
         if (r.kind != Resource::UniformBuffer && r.kind != Resource::StorageBuffer) continue;
         BufferRange range{};
         const void* src = nullptr;
+        bool snapshot_read = false;
         if (r.kind == Resource::UniformBuffer) {
             if (r.cbuf_index == kComputeDriverBank || (r.cbuf_index == kTextureHandleBank && compute_c2)) {
                 src = driver;
@@ -10432,7 +10485,10 @@ void Executor::dispatch(const cmd::Dispatch& v) {
                         static_cast<unsigned long long>(range.size));
         } else if (r.cbuf_index == kComputeDriverBank && r.cbuf_offset >= kComputeStorageBase) {
             int index = static_cast<int>((r.cbuf_offset - kComputeStorageBase) / 16);
-            if (index < kMaxStorage) range = sb.storage[index];
+            if (index < kMaxStorage) {
+                range = sb.storage[index];
+                snapshot_read = !r.is_written && (snapshot_reads & (1u << index));
+            }
             if (range.address && !r.is_written) note_read(5, range.address, range.size);
         }
         if (!src && range.address) src = reinterpret_cast<const void*>(range.address);
@@ -10443,8 +10499,9 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         const Overlay* ov = nullptr;
         if (src == reinterpret_cast<const void*>(range.address) && range.address && range.size) {
             // Sin uniones aquí (las hizo prepare_dispatch_overlays): una tiraría un overlay cuyo descriptor ya está en buffers.
+            const uint64_t read_size = snapshot_read ? std::min<uint64_t>(range.size, limits.maxStorageBufferRange) : size;
             ov = r.kind == Resource::StorageBuffer && r.is_written ? make_overlay(range.address, size, &ov_offset, false)
-                                                                    : find_overlay(range.address, size, &ov_offset);
+                                                                    : find_overlay(range.address, read_size, &ov_offset);
             if (ov && r.kind == Resource::StorageBuffer && r.is_written) {
                 note_overlay_written(range.address, kWrittenByCompute);
                 if (log_state_ && range.size <= 64 && (small_state_.size() < 32 || small_state_.count(range.address))) {
@@ -10471,14 +10528,25 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         const bool cacheable = src == reinterpret_cast<const void*>(range.address) && range.size &&
                                !(r.kind == Resource::StorageBuffer && r.is_written);
         VkDeviceSize mirror_offset = 0;
-        const Mirror* mir = !ov && cacheable && r.kind == Resource::StorageBuffer ? mirror(range.address, range.size, &mirror_offset)
+        VkBuffer snapshot_buffer = VK_NULL_HANDLE;
+        VkDeviceSize snapshot_offset = 0;
+        const uint8_t* snapshot_data = nullptr;
+        const VkDeviceSize snapshot_size = std::min<VkDeviceSize>(range.size, limits.maxStorageBufferRange);
+        if (!ov && snapshot_read && !gather_overlays(range.address, snapshot_size, &snapshot_buffer, &snapshot_offset, &snapshot_data)) {
+            cpu_publication_ok_ = false;
+            return skipped("mixed SSBO snapshot failed");
+        }
+        const Mirror* mir = !ov && !snapshot_buffer && cacheable && r.kind == Resource::StorageBuffer ? mirror(range.address, range.size, &mirror_offset)
                                                                                   : nullptr;
-        if (vigilar_nan_ && !ov && r.kind == Resource::StorageBuffer && range.address && range.size)  // DEPURACIÓN
+        if (vigilar_nan_ && !ov && !snapshot_buffer && r.kind == Resource::StorageBuffer && range.address && range.size)
             note_partial_read(r.is_written ? "un compute (SSBO escrito)" : "un compute", range.address, size);
         const char* from = "staging";  // DEPURACIÓN (read_after_dispatch)
         if (ov) {
             from = "overlay";
             buffers.push_back({ov->buffer, ov_offset, size});
+        } else if (snapshot_buffer) {
+            from = "snapshot";
+            buffers.push_back({snapshot_buffer, snapshot_offset, snapshot_size});
         } else if (mir) {
             from = "espejo";
             buffers.push_back({mir->buffer, mirror_offset, range.size});
@@ -10499,6 +10567,19 @@ void Executor::dispatch(const cmd::Dispatch& v) {
                 writebacks.push_back({a.data, range.address, static_cast<size_t>(size)});
             buffers.push_back({a.buffer, a.offset, size});
         }
+        if (trace_face_remap && r.kind == Resource::StorageBuffer && r.cbuf_index == kComputeDriverBank &&
+            r.cbuf_offset == kComputeStorageBase + 16 && range.address && range.size) {
+            // The shader masks each S1 word to 22 bits and indexes 12-byte entries in S0.
+            // Snapshot both views so the first bad input can be assigned to the upload or the guest.
+            face_remap = buffers.back();
+            mkdir("/storage/emulated/0/NieR-volcados", 0775);
+            std::ofstream guest(remap_file + ".guest.bin", std::ios::binary);
+            guest.write(reinterpret_cast<const char*>(range.address), face_remap.range);
+            guest.close();
+            NVN_LOG("normal remap: %s guest=%s source=%s address=%#llx map_bytes=%llu sums_bytes=%llu\n",
+                    remap_file.c_str(), guest ? "saved" : "failed", from, (unsigned long long)range.address,
+                    (unsigned long long)face_remap.range, (unsigned long long)sb.storage[0].size);
+        }
         if (read_after_) {  // DEPURACIÓN (read_after_dispatch): lo que recibe de verdad, para registrarlo tras ejecutarse
             char b[32];
             const bool driver_bank = r.cbuf_index == kComputeDriverBank;
@@ -10511,7 +10592,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
             else
                 snprintf(b, sizeof b, "ssbo c%u[0x%x]", r.cbuf_index, r.cbuf_offset);
             read_inputs.push_back({b, src == driver ? 0 : range.address, range.size, from,
-                                   r.kind == Resource::UniformBuffer ? 16u : 4u, buffers.back()});
+                                   r.kind == Resource::UniformBuffer ? 16u : 4u, buffers.back(), snapshot_data});
             if (ov && r.kind == Resource::StorageBuffer && r.is_written && read_after_size(range.size))
                 read_ranges.push_back({range.address, range.size});
         }
@@ -10594,6 +10675,10 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         begin();
     }
     if (!read_ranges.empty()) read_after_dispatch(*cs, x, y, z, read_ranges, read_inputs);  // DEPURACIÓN
+    if (face_remap.buffer) {
+        dump_gpu_buffer(face_remap, face_remap.range, remap_file + ".gpu.bin");
+        begin();
+    }
 }
 
 PicturePath Executor::blit(Texture& t, const VkRect2D& crop, VkImage dst, VkFormat format, VkExtent2D extent,
