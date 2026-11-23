@@ -37,7 +37,7 @@ final class Controls {
     // Los controles en pantalla. Cada uno: dónde está su centro (fracción del ancho y del alto de la pantalla), su tamaño
     // (1: el suyo) y si se ve.
     enum Ctl {
-        LSTICK, RSTICK, DPAD, A, B, X, Y, L, R, ZL, ZR, MINUS, PLUS, L3, R3, MENU, COMBO1, COMBO2, COMBO3, COMBO4,
+        LSTICK, RSTICK, DPAD, A, B, X, Y, L, R, ZL, ZR, MINUS, PLUS, L3, R3, MENU, MOD, COMBO1, COMBO2, COMBO3, COMBO4,
         COMBO5, COMBO6, COMBO7, COMBO8;
 
         boolean combo() { return ordinal() >= COMBO1.ordinal(); }
@@ -64,6 +64,7 @@ final class Controls {
         {0.045f, 0.70f, 1}, // L3
         {0.585f, 0.90f, 1}, // R3
         {0.50f, 0.07f, 1}, // MENU
+        {0.34f, 0.07f, 1}, // MOD (the MOD UI: only there with Lua scripts installed)
         {0.69f, 0.36f, 1}, // COMBO1
         {0.69f, 0.56f, 1}, // COMBO2
         {0.62f, 0.36f, 1}, // COMBO3
@@ -172,6 +173,7 @@ final class Controls {
             case RSTICK: return "Right stick";
             case DPAD: return "D-pad";
             case MENU: return "Menu";
+            case MOD: return "MOD UI";
             case MINUS: return "−";
             case PLUS: return "+";
             default:
@@ -383,7 +385,7 @@ final class Controls {
     // A button that presses something by itself: it can have an icon or a label, tap to hold, a copy (not the sticks,
     // the d-pad or the menu)
     static boolean isButton(Ctl c) {
-        return c != null && c != Ctl.LSTICK && c != Ctl.RSTICK && c != Ctl.DPAD && c != Ctl.MENU;
+        return c != null && c != Ctl.LSTICK && c != Ctl.RSTICK && c != Ctl.DPAD && c != Ctl.MENU && c != Ctl.MOD;
     }
 
     static boolean isStick(Ctl c) { return c == Ctl.LSTICK || c == Ctl.RSTICK; }
@@ -392,6 +394,20 @@ final class Controls {
     boolean styled(Ctl c) {
         int k = c.ordinal();
         return shape[k] != 0 || icon[k] != 0 || hold[k] || color[k] != 0 || label[k] != null || image[k] || outline[k] != 100;
+    }
+
+    // The editor's Delete: an added button goes, with its controller buttons and its look (its place is free for Add)
+    void removeButton(int k) {
+        combo[k] = comboPad[k] = 0;
+        comboKey[k] = 0;
+        int o = Ctl.COMBO1.ordinal() + k;
+        place[o] = HOME[o].clone();
+        shown[o] = true;
+        shape[o] = icon[o] = color[o] = 0;
+        hold[o] = fit[o] = false;
+        alpha[o] = outline[o] = 100;
+        label[o] = null;
+        if (image[o]) clearImage(Ctl.values()[o]);
     }
 
     // The first combo with no buttons (-1: all taken)

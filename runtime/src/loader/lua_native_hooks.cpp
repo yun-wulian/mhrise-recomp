@@ -1,6 +1,7 @@
 #include "loader/lua_native_hooks.h"
 #include "loader/application_lua.h"
 #include "loader/live_read.h"
+#include "loader/mod_ui.h"
 #include "loader/lua_mod_hooks.h"
 #include "loader/lua_values.h"
 #include <algorithm>
@@ -241,10 +242,9 @@ void report_error(Subscriber &s, const std::string &error) {
   if (!s.enabled.exchange(false))
     return;
   auto owner = read<uint32_t>(db->methods, 12ull * s.method) & id_mask;
-  log_message(ANDROID_LOG_ERROR, (db->full_name(owner) + "." +
-                                  std::string(db->method(s.method, owner)) +
-                                  " hook disabled: " + error)
-                                     .c_str());
+  auto message = db->full_name(owner) + "." + std::string(db->method(s.method, owner)) + " hook disabled: " + error;
+  log_message(ANDROID_LOG_ERROR, message.c_str());
+  script_error(message);
 }
 void execute(Invocation &inv, size_t n, int ref, int argument) {
   auto previous = swap_hook_storage(&inv.storage[n]);

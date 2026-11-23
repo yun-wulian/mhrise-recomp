@@ -292,8 +292,17 @@ static bool test_watched_handle_table(auto& e, nvn::Texture& source) {
     const auto with_image = checked_set();
     Sampler sample{};
     sample.desc.max_anisotropy = 1;
-    pool.register_sampler(1, &sample);
+    ResourceSlots<Sampler> sampler_slots;
+    auto sampler_ref = sampler_slots.insert(&sample);
+    pool.register_sampler(1, sampler_ref);
     const auto both = checked_set();
+    const auto hits = e.prof_bindless_memo_;
+    if (both != e.bindless_set(stages) ||
+        e.prof_bindless_memo_ - hits != (NVN_FLAG("no_bindless_memo") ? 0u : 1u)) return false;
+    sampler_slots.erase(sampler_ref);
+    if (checked_set() != with_image) return false;
+    pool.register_sampler(1, &sample);
+    if (checked_set() != both) return false;
     slots.erase(resource);  // Same pool snapshot, different resource generation.
     const auto only_sampler = checked_set();
     pool.register_sampler(1, {});

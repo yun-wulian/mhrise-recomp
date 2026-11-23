@@ -48,6 +48,18 @@ import java.util.function.Supplier;
 // and a line under it, the page itself (scrolls), a status line and the buttons at the bottom, above the system's bar.
 // With a controller: the d-pad moves the focus and A presses (Android turns A into DPAD_CENTER).
 public final class SetupActivity extends Activity {
+    static final class MenuLanguage {
+        static final String[] NAMES = {"English", "简体中文"};
+
+        static boolean usesChinese(android.content.Context context) {
+            return "zh-Hans".equals(context.getSharedPreferences("menu", 0).getString("language", "en"));
+        }
+
+        static void setChinese(android.content.Context context, boolean chinese) {
+            context.getSharedPreferences("menu", 0).edit().putString("language", chinese ? "zh-Hans" : "en").apply();
+        }
+    }
+
 
     private static final String GAME_FILE = "game_folder.txt", DATA_FILE = "carpeta.txt";
 
@@ -68,7 +80,7 @@ public final class SetupActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        chinese = SettingsMenu.usesChinese(this);
+        chinese = MenuLanguage.usesChinese(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
@@ -541,11 +553,11 @@ public final class SetupActivity extends Activity {
             language.setBackground(states(BRONZE, LIT, 1, 6));
             language.setOnClickListener(v -> new AlertDialog.Builder(this)
                     .setTitle("Language / 语言")
-                    .setSingleChoiceItems(SettingsMenu.LANGUAGES, chinese ? 1 : 0, (dialog, choice) -> {
+                    .setSingleChoiceItems(MenuLanguage.NAMES, chinese ? 1 : 0, (dialog, choice) -> {
                         dialog.dismiss();
                         if (chinese == (choice == 1)) return;
                         chinese = choice == 1;
-                        SettingsMenu.setChinese(this, chinese);
+                        MenuLanguage.setChinese(this, chinese);
                         redraw.run();
                     }).show());
             heading.addView(language);

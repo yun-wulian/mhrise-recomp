@@ -196,6 +196,8 @@ struct Texture {
 
 std::mutex& texel_writes_mutex();
 extern std::atomic<uint32_t> g_texel_writes;
+// Bumped whenever a texture's guest mapping changes (MapVirtual, any thread): the executor's bindless memo checks it
+extern std::atomic<uint64_t> g_mapping_serial;
 
 // Libera la imagen de Vulkan de una textura (texture.cpp); el objeto sigue siendo válido.
 void release_texture_gpu(Texture& t);

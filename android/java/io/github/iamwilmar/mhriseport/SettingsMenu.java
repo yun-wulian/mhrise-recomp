@@ -1,5 +1,7 @@
 package io.github.iamwilmar.mhriseport;
 
+import io.github.iamwilmar.mhriseport.SetupActivity.MenuLanguage;
+
 import android.app.Dialog;
 import android.content.Intent;
 import android.content.res.ColorStateList;
@@ -54,16 +56,6 @@ final class SettingsMenu {
     private final float scale;  // menu size (Display > Menu size): text and spacing, 0.8 by default
     static final String PREFS = "menu", SCALE_KEY = "escala";
     static final int SCALE_DEFAULT = 80;
-    private static final String LANGUAGE_KEY = "language";
-    static final String[] LANGUAGES = {"English", "简体中文"};
-
-    static boolean usesChinese(android.content.Context context) {
-        return "zh-Hans".equals(context.getSharedPreferences(PREFS, 0).getString(LANGUAGE_KEY, "en"));
-    }
-
-    static void setChinese(android.content.Context context, boolean chinese) {
-        context.getSharedPreferences(PREFS, 0).edit().putString(LANGUAGE_KEY, chinese ? "zh-Hans" : "en").apply();
-    }
 
     private final boolean chinese;
     private final String[] mapNames;
@@ -75,9 +67,9 @@ final class SettingsMenu {
     SettingsMenu(GameActivity activity, Controls cfg) {
         this.activity = activity;
         this.cfg = cfg;
-        chinese = usesChinese(activity);
+        chinese = MenuLanguage.usesChinese(activity);
         mapNames = mappingNames();
-        this.scale = menuScale(activity) / 100f;
+        this.scale = sizeFactor(activity);
         dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
@@ -187,13 +179,13 @@ final class SettingsMenu {
         header(tr("Menu", "菜单"));
         String language = tr("Menu language", "菜单语言");
         int selected = chinese ? 1 : 0;
-        row(language, LANGUAGES[selected] + "  ▾", tr("Language for setup and settings.", "首次设置和齿轮菜单使用的语言。"),
-                step -> dropDown(language, LANGUAGES, selected, i -> {
-                    setChinese(activity, i == 1);
+        row(language, MenuLanguage.NAMES[selected] + "  ▾", tr("Language for setup and settings.", "首次设置和齿轮菜单使用的语言。"),
+                step -> dropDown(language, MenuLanguage.NAMES, selected, i -> {
+                    MenuLanguage.setChinese(activity, i == 1);
                     dialog.dismiss();
                     new SettingsMenu(activity, cfg).show();
                 }), false);
-        number(tr("Menu size", "菜单大小"), tr("The size of this menu's text and buttons.", "调整本菜单的文字和按钮大小。"), 60, 130, 5, " %", () -> menuScale(activity), v -> {
+        number(tr("Menu size", "菜单大小"), tr("The size of this menu and the MOD UI, on top of what fits your screen.", "本菜单和 MOD UI 的大小（在适配屏幕的基础上调整）。"), 60, 130, 5, " %", () -> menuScale(activity), v -> {
                     try {
                         activity.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit().putInt(SCALE_KEY, v).apply();
                     } catch (RuntimeException ignored) {
@@ -707,14 +699,106 @@ final class SettingsMenu {
     // with a name here. Most of them are only read at start-up.
     private static native byte[] nativeLuaReport();
 
+    // What the Lua runtime did since the game started, in the settings menu's own look: where it stands, then its log
+    // (scripts loaded or failed, reloads), errors in red
+    private void showLuaReport() {
+        String text = new String(nativeLuaReport(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        String state;
+        switch (ModUi.runtime()) {
+            case 2: state = tr("Running: the scripts are loaded.", "运行中：脚本已加载。"); break;
+            case 1: state = tr("Ready: the scripts load once you're in the village or a quest.", "已就绪：进入村庄或任务后加载脚本。"); break;
+            default: state = tr("Not running: no Lua scripts were installed when the game started.", "未运行：游戏启动时没有安装 Lua 脚本。");
+        }
+        final Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(activity);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(14));
+        box.setBackground(plate(PANEL, 2, 0));
+        TextView title = text("Lua / TDB", 20, GOLD, true);
+        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        box.addView(title);
+        box.addView(rule(RED, 2));
+        box.addView(rule(GREEN, 1));
+        TextView now = text(state, 16, CREAM, false);
+        now.setPadding(0, dp(12), 0, dp(8));
+        box.addView(now);
+
+        LinearLayout lines = new LinearLayout(activity);
+        lines.setOrientation(LinearLayout.VERTICAL);
+        lines.setPadding(dp(10), dp(8), dp(10), dp(8));
+        lines.setBackground(plate(ROW, 1, 0));
+        if (text.isEmpty()) lines.addView(text(tr("Nothing logged yet.", "暂无记录。"), 14, DIM, false));
+        for (String line : text.split("\n")) {
+            if (line.isEmpty()) continue;
+            boolean bad = line.contains("rror") || line.contains("failed") || line.contains(" hook: ");
+            TextView t = text(line, 13, bad ? 0xFFF08070 : CREAM, false);
+            t.setTypeface(Typeface.MONOSPACE);
+            t.setTextIsSelectable(true);
+            t.setPadding(0, dp(2), 0, dp(2));
+            lines.addView(t);
+        }
+        ScrollView scroll = new ScrollView(activity);
+        scroll.addView(lines);
+        DisplayMetrics m = activity.getResources().getDisplayMetrics();
+        box.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+
+        LinearLayout buttons = new LinearLayout(activity);
+        buttons.setPadding(0, dp(14), 0, 0);
+        TextView copy = button(tr("Copy", "复制"), false);
+        copy.setOnClickListener(v -> {
+            android.content.ClipboardManager clip =
+                    (android.content.ClipboardManager) activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            if (clip != null) clip.setPrimaryClip(android.content.ClipData.newPlainText("Lua / TDB", state + "\n" + text));
+            d.dismiss();
+        });
+        TextView ok = button(tr("OK", "确定"), true);
+        ok.setOnClickListener(v -> d.dismiss());
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, dp(48), 1);
+        half.setMargins(dp(4), 0, dp(4), 0);
+        buttons.addView(copy, half);
+        buttons.addView(ok, new LinearLayout.LayoutParams(half));
+        box.addView(buttons);
+
+        d.setContentView(box);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            // (as tall as the log needs, the lines scrolling past 80% of the screen)
+            box.measure(View.MeasureSpec.makeMeasureSpec(Math.min(dp(720), (int) (m.widthPixels * 0.8f)), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            int tall = Math.min(box.getMeasuredHeight(), (int) (m.heightPixels * 0.8f));
+            w.setLayout(Math.min(dp(720), (int) (m.widthPixels * 0.8f)), tall);
+        }
+        d.show();
+    }
+
+    private void modChanged(File dir) {
+        modChanged(ModFiles.gameFiles(dir), ModFiles.scripts(dir));
+    }
+
+    private void modChanged(boolean gameFiles, boolean scripts) {
+        if (!activity.modsChanged(gameFiles, scripts) && scripts)
+            android.widget.Toast.makeText(activity, tr("Script reload requested.", "已请求重新加载 Lua 脚本。"), android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    // Game files changed: restart now (losing what isn't saved), or later from Mods & cheats
+    void askRestart() {
+        dropDown(tr("Restart to load the mod's game files? Progress since your last save is lost.",
+                        "重启以加载 MOD 的游戏资源？上次存档之后的进度将会丢失。"),
+                new String[] {tr("Later", "稍后"), tr("Restart now", "立即重启")}, -1, k -> {
+                    if (k == 1) activity.restartGame();
+                });
+    }
+
     private void buildDebug() {
-        if ("io.github.iamwilmar.mhriseport.lab".equals(activity.getPackageName())) {
-            action("Lua / TDB", tr("View startup script results.", "查看启动时脚本的运行结果。"), () -> {
-                String text = new String(nativeLuaReport(), java.nio.charset.StandardCharsets.UTF_8);
-                new android.app.AlertDialog.Builder(activity).setTitle("Lua / TDB")
-                    .setMessage(text.isEmpty() ? tr("Waiting for game startup.", "正在等待游戏启动。") : text)
-                    .setPositiveButton(android.R.string.ok, null).show();
-            });
+        if (GameActivity.luaBuild(activity)) {
+            action("Lua / TDB", tr("View startup script results.", "查看启动时脚本的运行结果。"), this::showLuaReport);
+            flag(tr("Object Explorer", "对象浏览器"),
+                    tr("REFramework's explorer in the MOD UI: search the game's types, see their fields and methods, and "
+                            + "read a manager's fields live. For writing scripts. Takes effect on the next start.",
+                            "在 MOD 界面中加入 REFramework 的对象浏览器：搜索游戏类型、查看字段和方法，并实时读取管理器的字段。用于编写脚本。下次启动生效。"),
+                    "object_explorer", false);
         }
         String next = tr(" Takes effect on the next start.", "下次启动生效。");
         note(tr("For testing drivers and sending logs. If the game looks right, leave all of this as it is.", "用于测试驱动和收集日志。画面正常时可保留默认设置。"));
@@ -1141,6 +1225,96 @@ final class SettingsMenu {
         box.requestFocus();
     }
 
+    private String hotkeyName(int[] keys) {
+        if (keys.length == 0) return tr("none", "无");
+        StringBuilder b = new StringBuilder();
+        for (int k : keys) b.append(b.length() > 0 ? " + " : "").append(Controls.keyName(k));
+        return b.toString();
+    }
+
+    // Waits for one to three controller buttons held together; the chord is taken when they're all let go
+    private void captureHotkey() {
+        final Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(activity);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(14));
+        box.setBackground(plate(PANEL, 2, 0));
+        TextView title = text(tr("MOD UI hotkey", "MOD 界面快捷键"), 20, GOLD, true);
+        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        box.addView(title);
+        box.addView(rule(RED, 2));
+        box.addView(rule(GREEN, 1));
+        TextView ask = text(tr("Hold up to three controller buttons together, then let go.", "在手柄上同时按住最多三个按键，然后松开。"),
+                16, CREAM, false);
+        ask.setPadding(0, dp(12), 0, dp(4));
+        box.addView(ask);
+        TextView now = text(tr("Now: ", "当前：") + hotkeyName(ModUi.hotkey(ini)), 14, DIM, false);
+        box.addView(now);
+
+        final java.util.List<Integer> chord = new java.util.ArrayList<>();
+        final java.util.Set<Integer> down = new java.util.HashSet<>();
+        final boolean[] done = {false};
+        final java.util.function.Consumer<String> take = value -> {
+            if (done[0]) return;
+            done[0] = true;
+            ini.set(ModUi.HOTKEY, value);
+            d.dismiss();
+            changed();
+            build();
+        };
+        d.setOnKeyListener((dialog, keyCode, ev) -> {
+            boolean pad = (ev.getSource() & (InputDevice.SOURCE_GAMEPAD | InputDevice.SOURCE_JOYSTICK
+                    | InputDevice.SOURCE_DPAD | InputDevice.SOURCE_KEYBOARD)) != 0 && ev.getDevice() != null
+                    && !ev.getDevice().isVirtual();
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) return false;
+            if (!pad) return keyCode != KeyEvent.KEYCODE_BACK;
+            if (ev.getAction() == KeyEvent.ACTION_DOWN && ev.getRepeatCount() == 0) {
+                down.add(keyCode);
+                if (!chord.contains(keyCode) && chord.size() < 3) chord.add(keyCode);
+                int[] keys = new int[chord.size()];
+                for (int i = 0; i < keys.length; i++) keys[i] = chord.get(i);
+                now.setText(hotkeyName(keys));
+            } else if (ev.getAction() == KeyEvent.ACTION_UP) {
+                down.remove(keyCode);
+                if (down.isEmpty() && !chord.isEmpty()) {
+                    StringBuilder v = new StringBuilder();
+                    for (int k : chord) v.append(v.length() > 0 ? "+" : "").append(k);
+                    take.accept(v.toString());
+                }
+            }
+            return true;
+        });
+
+        LinearLayout buttons = new LinearLayout(activity);
+        buttons.setPadding(0, dp(14), 0, 0);
+        TextView usual = button(tr("Default", "默认"), false);
+        usual.setOnClickListener(v -> take.accept(null));
+        TextView none = button(tr("None", "无"), false);
+        none.setOnClickListener(v -> take.accept("0"));
+        TextView cancel = button(tr("Cancel", "取消"), true);
+        cancel.setOnClickListener(v -> {
+            done[0] = true;
+            d.dismiss();
+        });
+        LinearLayout.LayoutParams third = new LinearLayout.LayoutParams(0, dp(46), 1);
+        third.setMargins(dp(4), 0, dp(4), 0);
+        buttons.addView(usual, third);
+        buttons.addView(none, new LinearLayout.LayoutParams(third));
+        buttons.addView(cancel, new LinearLayout.LayoutParams(third));
+        box.addView(buttons);
+
+        d.setContentView(box);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            DisplayMetrics m = activity.getResources().getDisplayMetrics();
+            w.setLayout(Math.min(dp(520), (int) (m.widthPixels * 0.7f)), ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        d.show();
+        box.requestFocus();
+    }
+
     // ---- the layout editor's Edit: one control -------------------------------------------------------------------------
 
     // Its size and opacity (sliders), its colour, edge and a picture; the shape too but for the d-pad's (a stick's is
@@ -1204,14 +1378,15 @@ final class SettingsMenu {
         goldBar(alpha);
         box.addView(alpha);
 
-        final boolean button = Controls.isButton(c), stick = Controls.isStick(c), menu = c == Controls.Ctl.MENU;
+        final boolean button = Controls.isButton(c), stick = Controls.isStick(c),
+                menu = c == Controls.Ctl.MENU || c == Controls.Ctl.MOD;
         if (c != Controls.Ctl.DPAD)
             box.addView(pickRow(tr("Shape", "形状"), chinese ? new String[]{"默认", "圆形", "圆角方形", "方形"} : Controls.SHAPES, () -> cfg.shape[k], v -> cfg.shape[k] = v,
                     stick ? tr("The stick's base. Its own: the usual circle.", "摇杆底座的形状。默认使用圆形。")
                           : tr("Its own: the usual look (a combo of one button looks like that button).", "默认使用原有外观，单键组合与对应的按键外观一致。")));
         if (button || menu)
             box.addView(pickRow(tr("Icon", "图标"), chinese ? new String[]{"无（文字）", "上箭头", "下箭头", "左箭头", "右箭头", "星形", "菱形", "盾牌", "刀刃", "准星", "短横线"} : Controls.ICONS, () -> cfg.icon[k], v -> cfg.icon[k] = v,
-                    menu ? tr("An icon instead of the gear.", "用图标替换齿轮。") : tr("An icon instead of the button's letters.", "用图标替换按键文字。")));
+                    menu ? (c == Controls.Ctl.MOD ? tr("An icon instead of MOD.", "用图标替换 MOD 文字。") : tr("An icon instead of the gear.", "用图标替换齿轮。")) : tr("An icon instead of the button's letters.", "用图标替换按键文字。")));
         final TextView edgeValue = text("", 16, GOLD, false);
         Runnable showEdge = () -> edgeValue.setText(cfg.outline[k] == 0 ? tr("None", "无") : cfg.outline[k] + " %");
         showEdge.run();
@@ -1544,20 +1719,35 @@ final class SettingsMenu {
 
     private void buildMods() {
         header(tr("Mods", "MOD"));
-        if ("io.github.iamwilmar.mhriseport.lab".equals(activity.getPackageName())) {
+        if (GameActivity.luaBuild(activity)) {
             action(tr("MOD UI", "MOD 界面"), tr("Open script controls.", "打开 MOD 脚本的控制界面。"), () -> {
                 dialog.dismiss();
                 activity.showModUi();
             });
+            if (folder != null) {
+                int[] keys = ModUi.hotkey(ini);
+                action(tr("MOD UI controller hotkey: ", "MOD 界面手柄快捷键：") + hotkeyName(keys),
+                        tr("Buttons pressed together on the controller open and close the MOD UI. L3 + R3 by default, as in "
+                                + "REFramework.", "在手柄上同时按下这些按键可打开或关闭 MOD 界面。默认为 L3 + R3，与 REFramework 相同。"),
+                        this::captureHotkey);
+                number(tr("MOD UI opacity", "MOD 界面不透明度"),
+                        tr("How much of the game the MOD UI's window hides. Lower to watch the hunt while changing values.",
+                                "MOD 界面窗口遮挡游戏画面的程度。调低后可以一边调整数值一边观察狩猎。"),
+                        30, 100, 5, " %", () -> ModUi.opacity(ini), v -> ini.set(ModUi.OPACITY, Integer.toString(v)));
+            }
         }
         if (folder == null) {
             note(tr("Pick the game folder first.", "请先选择游戏目录。"));
             return;
         }
         List<ModFiles.Mod> mods = ModFiles.list(folder);
+        if (activity.restartPending)
+            action(tr("Restart to apply your changes", "重启以应用更改"),
+                    tr("Mods with game files were added, removed, or turned on or off: those load when the game starts.",
+                            "已添加、移除或启停含游戏资源的 MOD，这些资源在游戏启动时加载。"), this::askRestart);
         note(tr("Each mod is a folder in ", "每个 MOD 的目录位于 ") + ModFiles.modsDir(folder) + tr(", laid out as for Eden: romfs/ with the game files it "
-                + "replaces, cheats/ with its cheat files. Adding a mod or turning one on or off applies the next time the "
-                + "game starts.", "。目录结构与 Eden 相同：romfs/ 放替换的游戏资源，cheats/ 放金手指。新增或启停 MOD 后需重启游戏。"));
+                + "replaces, cheats/ with its cheat files. Scripts and cheats apply right away; game files the next time the "
+                + "game starts.", "。目录结构与 Eden 相同：romfs/ 放替换的游戏资源，cheats/ 放金手指。脚本和金手指立即生效，游戏资源需重启游戏。"));
         action(tr("Add a mod archive", "添加 MOD 压缩包"),
                 tr("ZIP, 7z, RAR or TAR. Import game resources, REFramework scripts and their data. Restart to apply.", "支持 ZIP、7z、RAR 和 TAR。可导入游戏资源、REFramework 脚本及数据。重启游戏生效。"),
                 () -> {
@@ -1573,6 +1763,7 @@ final class SettingsMenu {
             toggle(m.name, what + tr(". In ", "。目录：") + m.dir.getName() + ".", () -> m.on ? 1 : 0, v -> {
                 if (!ModFiles.setOn(m, v != 0)) android.widget.Toast.makeText(activity, tr("Couldn't rename ", "无法重命名 ") + m.dir.getName(),
                         android.widget.Toast.LENGTH_LONG).show();
+                else modChanged(m.dir);
                 build();
             });
         }
@@ -1581,7 +1772,10 @@ final class SettingsMenu {
             for (int i = 0; i < names.length; i++) names[i] = mods.get(i).name;
             action(tr("Remove a mod", "移除 MOD"), tr("Deletes the mod's folder and everything in it.", "删除该 MOD 的目录及其中所有文件。"), () -> dropDown(tr("Remove a mod", "移除 MOD"), names, -1,
                     i -> dropDown(tr("Delete ", "删除 ") + names[i] + "?", new String[] {tr("Keep it", "保留"), tr("Delete it", "删除")}, -1, k -> {
-                        if (k == 1) ModFiles.delete(mods.get(i));
+                        if (k == 1) {
+                            boolean game = ModFiles.gameFiles(mods.get(i).dir), lua = ModFiles.scripts(mods.get(i).dir);
+                            if (ModFiles.delete(mods.get(i))) modChanged(game, lua);
+                        }
                         build();
                     })));
         }
@@ -1765,6 +1959,18 @@ final class SettingsMenu {
     }
 
     // Saved menu size, in %
+    // Menu size on top of the screen's own: the menus were laid out on a phone about 400 dp tall, so a small phone
+    // gets them a little smaller and a tablet bigger (the same share of the screen), then Menu size moves that
+    static float screenFactor(android.content.Context c) {
+        android.util.DisplayMetrics m = c.getResources().getDisplayMetrics();
+        float shortDp = Math.min(m.widthPixels, m.heightPixels) / m.density;
+        return Math.max(0.85f, Math.min(1.75f, shortDp / 400f));
+    }
+
+    static float sizeFactor(android.content.Context c) {
+        return menuScale(c) / 100f * screenFactor(c);
+    }
+
     static int menuScale(android.content.Context c) {
         try {
             return c.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).getInt(SCALE_KEY, SCALE_DEFAULT);

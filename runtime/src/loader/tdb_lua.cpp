@@ -2,6 +2,8 @@
 #include "loader/application_lua.h"
 #include "loader/imports.h"
 #include "loader/live_read.h"
+#include "loader/lua_explorer.h"
+#include "nnsdk/ini.h"
 #include "loader/lua_data.h"
 #include "loader/lua_frame_gc.h"
 #include "loader/lua_mod_hooks.h"
@@ -455,10 +457,24 @@ int pc_module_searcher(lua_State *L) {
   return lua_error(L);
 }
 
+std::vector<fs::path> resident_roots, launch_mixed_roots;
+enum class RuntimeStatus : jint { Inactive, WaitingForPlayer, Running };
+std::atomic<RuntimeStatus> runtime_status{RuntimeStatus::Inactive};
+
+std::vector<fs::path> mixed_roots(const std::vector<fs::path> &roots) {
+  std::vector<fs::path> mixed;
+  for (size_t i = 1; i < roots.size(); ++i) { // entry zero is the private script directory
+    const auto dir = roots[i].parent_path();
+    if (fs::is_directory(dir / "romfs") || fs::is_directory(dir / "exefs"))
+      mixed.push_back(roots[i]);
+  }
+  return mixed;
+}
+
 bool load_scripts(lua_State *L, const fs::path &directory) {
   std::vector<fs::path> scripts;
   auto roots = directory.filename() == "autorun"
-                   ? mod_lua::framework_roots(directory.parent_path())
+                   ? resident_roots
                    : std::vector<fs::path>{directory.parent_path()};
   std::set<std::string> seen;
   for (auto &root : roots) {
@@ -479,16 +495,20 @@ bool load_scripts(lua_State *L, const fs::path &directory) {
   for (const auto &path : scripts) {
     auto previous = mod_lua::checkpoint();
     auto previous_events = mod_lua::event_checkpoint(L);
-    if (luaL_loadfilex(L, path.c_str(), "t") || lua_pcall(L, 0, 0, 0)) {
+    mod_lua::set_loading_script(path.stem().string());
+    bool failed = luaL_loadfilex(L, path.c_str(), "t") || lua_pcall(L, 0, 0, 0);
+    mod_lua::set_loading_script({});
+    if (failed) {
       const char *error = lua_tostring(L, -1);
-      report((path.filename().string() + ": " +
-              (error ? error : "non-string Lua error"))
-                 .c_str(),
-             true);
+      auto message = path.filename().string() + ": " + (error ? error : "non-string Lua error");
+      report(message.c_str(), true);
+      mod_lua::script_error(message);
       lua_pop(L, 1);
       mod_lua::rollback(L, previous);
       mod_lua::rollback_events(L, previous_events);
       ok = false;
+    } else {
+      report(("Loaded " + path.filename().string()).c_str());
     }
   }
   return ok;
@@ -496,6 +516,7 @@ bool load_scripts(lua_State *L, const fs::path &directory) {
 bool initialize_resident(const Module &main, const fs::path &directory,
                          bool run = true) {
   auto &tdb = *resident_metadata;
+  mod_lua::clear_script_errors();
   resident_vm.reset(luaL_newstate());
   auto *L = resident_vm.get();
   if (!L)
@@ -504,9 +525,9 @@ bool initialize_resident(const Module &main, const fs::path &directory,
   mod_lua::open_events(L);
   mod_lua::open_imgui(L);
   mod_lua::open_values(L);
-  mod_lua::open_data(L, directory.parent_path());
+  mod_lua::open_data(L, directory.parent_path(), resident_roots);
   lua_getglobal(L, "package");
-  const auto roots = mod_lua::framework_roots(directory.parent_path());
+  const auto &roots = resident_roots;
   std::string search;
   for (const auto &root : roots) {
     auto dir = (root / "autorun").string();
@@ -546,6 +567,7 @@ bool initialize_resident(const Module &main, const fs::path &directory,
   if (resident_frame)
     open_live_read(L, *resident_frame);
   mod_lua::select_event_state(L, &resident_gc);
+  mod_lua::watch_missing_calls(L);
   return !run || load_scripts(L, directory);
 }
 
@@ -627,6 +649,8 @@ void on_player_update(uintptr_t context, uintptr_t manager) {
       auto live = p.script.parent_path() / "live";
       if (fs::exists(live))
         load_scripts(resident_vm.get(), live);
+      mod_lua::load_object_explorer(resident_vm.get(), *resident_metadata);
+      runtime_status.store(RuntimeStatus::Running);
     } catch (const std::exception &e) {
       report(e.what(), true);
     }
@@ -656,14 +680,23 @@ void on_player_update(uintptr_t context, uintptr_t manager) {
         p.pending.fetch_or(pending);
         return;
       }
+      auto dir = p.script.parent_path();
+      auto roots = mod_lua::framework_roots(dir);
+      // A pure-script reload may have been queued before a mixed mod was installed or toggled.
+      // Keep the running VM paired with the resource set loaded by the game at startup.
+      if (mixed_roots(roots) != launch_mixed_roots)
+        throw std::runtime_error("Restart the game to apply resource mod changes");
       mod_lua::reset_callbacks();
       mod_lua::select_event_state(nullptr, nullptr);
       mod_lua::rollback(resident_vm.get(), 0);
+      runtime_status.store(RuntimeStatus::Inactive);
       resident_vm.reset();
-      auto dir = p.script.parent_path();
+      resident_roots = std::move(roots);
       bool ok = initialize_resident(p.main, dir / "autorun");
       if (fs::exists(dir / "live"))
         ok = load_scripts(resident_vm.get(), dir / "live") && ok;
+      mod_lua::load_object_explorer(resident_vm.get(), *resident_metadata);
+      runtime_status.store(RuntimeStatus::Running);
       report(ok ? "Lua reload complete"
                 : "Lua reload finished with script errors",
              !ok);
@@ -713,6 +746,12 @@ void on_player_update(uintptr_t context, uintptr_t manager) {
   }
 }
 
+// For the MOD UI button: 0 no Lua runtime (no scripts installed), 1 scripts loaded but not running yet (they start
+// with the game's first frame in a village or quest), 2 running
+extern "C" JNIEXPORT jint JNICALL Java_io_github_iamwilmar_mhriseport_ModUi_nativeRuntime(JNIEnv *, jclass) {
+  return static_cast<jint>(runtime_status.load());
+}
+
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_io_github_iamwilmar_mhriseport_SettingsMenu_nativeLuaReport(JNIEnv *env,
                                                                  jclass) {
@@ -744,7 +783,7 @@ Java_io_github_iamwilmar_mhriseport_SettingsMenu_nativeLuaReport(JNIEnv *env,
 bool run_tdb_autorun(const Module &main, const fs::path &directory) {
   try {
     auto roots = mod_lua::framework_roots(directory.parent_path());
-    if (std::none_of(roots.begin(), roots.end(), [](const auto &r) {
+    if (!nnsdk::ini::on("object_explorer") && std::none_of(roots.begin(), roots.end(), [](const auto &r) {
           return fs::is_directory(r / "autorun");
         })) {
       report("No autorun directory");
@@ -752,9 +791,12 @@ bool run_tdb_autorun(const Module &main, const fs::path &directory) {
     }
     if (resident_vm)
       throw std::runtime_error("Autorun is already initialized");
+    launch_mixed_roots = mixed_roots(roots);
+    resident_roots = std::move(roots);
     resident_metadata = std::make_unique<Tdb>(main);
-    return initialize_resident(main, directory,
-                               getenv("NIER_INTERNO") == nullptr);
+    bool ok = initialize_resident(main, directory, getenv("NIER_INTERNO") == nullptr);
+    runtime_status.store(RuntimeStatus::WaitingForPlayer);
+    return ok;
   } catch (const std::exception &e) {
     report(e.what(), true);
     return false;

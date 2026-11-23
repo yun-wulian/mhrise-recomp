@@ -16,7 +16,7 @@ public final class LooseModImportTest {
             boolean reject = archive.getName().startsWith("reject-");
             int before = ModFiles.list(data).size();
             try (FileInputStream in = new FileInputStream(archive)) {
-                System.out.println(ModFiles.importArchive(in, archive.getName(), data));
+                System.out.println(ModFiles.importArchive(in, archive.getName(), data).description);
                 if (reject)
                     throw new AssertionError("Accepted invalid archive");
             } catch (IOException error) {

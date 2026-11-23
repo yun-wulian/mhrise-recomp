@@ -1,5 +1,7 @@
 package io.github.iamwilmar.mhriseport;
 
+import io.github.iamwilmar.mhriseport.SetupActivity.MenuLanguage;
+
 import android.app.NativeActivity;
 import android.content.Context;
 import android.content.Intent;
@@ -43,7 +45,107 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     private Controls controls;
     private TouchPad pad;
     private ModUi modUi;
-    void showModUi() { modUi.setMenu(true); }
+    void showModUi() {
+        if (modUi != null && modUiReady()) modUi.setMenu(true);
+    }
+
+    // The MOD UI draws the Lua scripts' windows: with no script running there's nothing to draw, and the button seemed
+    // to do nothing. Says why instead.
+    // ---- Mods changed while the game runs ----
+    // Scripts reload in place: the Lua runtime reads the mods folder again (a request file it looks for each frame).
+    // Game files only load when the game starts, so those wait for a restart, offered by the settings menu. Returns
+    // whether this change needs one.
+    boolean restartPending;
+    boolean modsChanged(boolean gameFiles, boolean scripts) {
+        if (gameFiles) restartPending = true;
+        if (scripts && !restartPending && !reloadScripts()) restartPending = true;
+        if (pad != null) pad.setModsAvailable(luaScripts());
+        return restartPending;
+    }
+
+    private boolean reloadScripts() {
+        if (!luaBuild(this) || ModUi.runtime() == 0) return false;  // (no runtime: only a start loads them)
+        File dir = new File(getFilesDir(), "reframework");
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) return false;
+            File request = new File(dir, "reload.request");
+            return request.exists() || request.createNewFile();
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    // Closes the game and opens it again (the launcher's activity, in a new task, started as this process ends)
+    void restartGame() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch != null && launch.getComponent() != null)
+            startActivity(Intent.makeRestartActivityTask(launch.getComponent()));
+        finishAffinity();
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    private boolean luaAtLaunch;  // (the runtime only reads the scripts when the game starts)
+    private boolean modUiReady() {
+        String why;
+        boolean chinese = MenuLanguage.usesChinese(this);
+        switch (ModUi.runtime()) {
+            case 2: return true;
+            case 1:
+                why = chinese ? "进入村庄或任务后，脚本会开始运行，届时可打开 MOD 界面。"
+                        : "Open the MOD UI after entering the village or a quest, when scripts start.";
+                break;
+            default:
+                if (luaAtLaunch) {
+                    why = chinese ? "Lua 运行时未启动，请在「设置 → 调试 → Lua / TDB」查看报告。"
+                            : "The Lua runtime didn't start. Settings → Debug → Lua / TDB shows why.";
+                    break;
+                }
+                if (luaScripts()) {
+                    why = chinese ? "请重新启动游戏以加载刚添加的 Lua MOD。"
+                            : "Lua mods added since the game started load the next time it starts: close the game fully "
+                            + "and open it again.";
+                    break;
+                }
+                why = chinese ? "请在「MOD 与金手指」中添加 Lua 脚本，或在「调试」中启用对象浏览器，然后重启游戏。"
+                        : "No Lua scripts are installed, so the MOD UI has nothing to show. Add a REFramework script mod in "
+                        + "Settings → Mods & cheats, or turn on Debug → Object Explorer, and restart the game.";
+        }
+        Toast.makeText(this, why, Toast.LENGTH_LONG).show();
+        return false;
+    }
+
+    // The frame rate the game is limited to (Display → FPS limit): the touch controls animate no faster
+    private int gameFps() {
+        File folder = SettingsMenu.gameFolder(this);
+        if (folder == null) return 30;
+        Ini ini = new Ini(folder);
+        if (ini.on("60fps")) return 60;
+        for (int fps : new int[] {45, 40, 25, 20})
+            if (ini.on("fps_" + fps)) return fps;
+        return 30;
+    }
+    // The controller hotkey (android_main.cpp, from a thread of its own) and the floating button
+    public void toggleModUi() {
+        runOnUiThread(() -> {
+            if (modUi == null) return;
+            if (modUi.menuOpen()) modUi.setMenu(false);
+            else if (modUiReady()) modUi.setMenu(true);
+        });
+    }
+
+    // A build with the Lua runtime (tools/build_apk.sh LUA_LAB=1, the releases): it ships assets/lua_build. The script
+    // menus and the mod UI only exist there.
+    private static Boolean lua;
+    static boolean luaBuild(android.content.Context c) {
+        if (lua == null) {
+            try (java.io.InputStream in = c.getAssets().open("lua_build")) {
+                lua = true;
+            } catch (java.io.IOException e) {
+                lua = false;
+            }
+        }
+        return lua;
+    }
     private boolean shown;
     private Vibrator vibrator;
     private CaptureButton capture;  // the floating capture button, while Debug → Capture button is on
@@ -63,6 +165,9 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         applyPad();
         pad = new TouchPad(this, controls, this);
+        pad.setGameFps(gameFps());
+        luaAtLaunch = luaScripts();
+        pad.setModsAvailable(luaAtLaunch);
         // La ventana del juego tiene que estar puesta para colgarle el panel: después del primer paso por la cola.
         getWindow().getDecorView().post(this::showPad);
         showSaveMessage();
@@ -106,7 +211,7 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         try {
             getWindowManager().addView(pad, lp);
             shown = true;
-            if ("io.github.iamwilmar.mhriseport.lab".equals(getPackageName())) {
+            if (luaBuild(this)) {
                 modUi = new ModUi(this);
                 if (resumed) modUi.onResume();
             }
@@ -269,8 +374,10 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     void refresh() {
         controls.save();
         applyPad();
+        pad.setGameFps(gameFps());
         pad.invalidate();
         showCapture();
+        pad.setModsAvailable(luaScripts());
         applyTurbo(true);
     }
 
@@ -349,6 +456,27 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         controls.save();
     }
 
+    @Override
+    public void buttonRemoved() {
+        controls.save();
+        applyPad();  // (its controller buttons go with it)
+    }
+
+    // Lua scripts the MOD UI can show: an enabled mod with REFramework scripts, or the Object Explorer. The MOD control
+    // is only on the screen then.
+    private boolean luaScripts() {
+        if (!luaBuild(this)) return false;
+        File folder = SettingsMenu.gameFolder(this);
+        if (folder == null) return false;
+        if (new Ini(folder).on("object_explorer")) return true;
+        try {
+            for (ModFiles.Mod m : ModFiles.list(folder))
+                if (m.on && new File(m.dir, "reframework/autorun").isDirectory()) return true;
+        } catch (RuntimeException ignored) {
+        }
+        return false;
+    }
+
     // ---- pictures for buttons, and layout files (the system's file picker answers in onActivityResult) ----------------
 
     private static final int PICK_IMAGE = 41, EXPORT_LAYOUT = 42, IMPORT_LAYOUT = 43, IMPORT_MOD = 44, IMPORT_CHEATS = 45, IMPORT_DRIVER = 46, IMPORT_DLL = 47;
@@ -407,18 +535,29 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         Toast.makeText(this, "Adding it…", Toast.LENGTH_SHORT).show();
         new Thread(() -> {
             String done;
+            ModFiles.ImportResult imported = null;
             try {
-                if (request == IMPORT_MOD) done = "Mod added: " + ModFiles.importArchive(getContentResolver(), uri, data);
+                if (request == IMPORT_MOD) {
+                    imported = ModFiles.importArchive(getContentResolver(), uri, data);
+                    done = (MenuLanguage.usesChinese(this) ? "已添加 MOD：" : "Mod added: ") + imported.description;
+                }
                 else if (request == IMPORT_CHEATS) done = "Cheats added: " + ModFiles.importCheats(getContentResolver(), uri, data);
                 else if (request == IMPORT_DRIVER) done = "Driver added: " + Drivers.unpack(this, uri) + ". Choose it in the list to use it.";
                 else done = "Lossless.dll imported (" + Drivers.importDll(this, uri, data) + "). It's used from the next start.";
             } catch (java.io.IOException | RuntimeException e) {
                 done = "Couldn't add it: " + e.getMessage();
             }
+            final ModFiles.ImportResult added = imported;
             final String msg = done;
             runOnUiThread(() -> {
-                Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
-                if (!isFinishing()) new SettingsMenu(this, controls).show();
+                boolean restart = added != null && modsChanged(added.gameFiles, added.scripts);
+                String reload = MenuLanguage.usesChinese(this) ? "。已请求重新加载脚本。" : ". Script reload requested.";
+                Toast.makeText(this, msg + (added != null && added.scripts && !restart ? reload : ""),
+                        Toast.LENGTH_LONG).show();
+                if (isFinishing()) return;
+                SettingsMenu menu = new SettingsMenu(this, controls);
+                menu.show();
+                if (restart) menu.askRestart();
             });
         }, "ModImport").start();
     }

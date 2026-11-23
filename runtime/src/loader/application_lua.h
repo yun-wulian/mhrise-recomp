@@ -12,6 +12,8 @@ std::recursive_mutex &lua_mutex();
 void open_events(lua_State *);
 void install_app_entries(const Module &, rise::Tdb &);
 void draw_ui();
+// The script being loaded: what it registers is shown under its name in the MOD UI
+void set_loading_script(const std::string &name);
 void draw_frame();
 void reset_callbacks();
 void save_config();

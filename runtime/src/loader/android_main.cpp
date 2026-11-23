@@ -584,9 +584,17 @@ void touch_point(int32_t action, float x, float y, int64_t time_ns, int32_t widt
     }
 }
 
+#ifdef MHRISE_LUA_DEBUG
+bool mod_ui_hotkey(AInputEvent* event);
+void forget_held_keys();
+#endif
+
 int32_t on_input(android_app* app, AInputEvent* event) {
     take_over(event);
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY) {
+#ifdef MHRISE_LUA_DEBUG
+        if (mod_ui_hotkey(event)) return 1;
+#endif
         // El gesto de "atrás" del sistema desde el borde derecho (aparece una flecha): Android se queda con el toque y manda
         // la tecla BACK. No es el botón del juego (antes hacía de "-"): abre o cierra el panel del HUD (nvn/hud.cpp). Se
         // reconoce porque llega poco después de un toque que se posó en ese borde; el BACK de un botón físico o del borde
@@ -734,6 +742,10 @@ void on_cmd(android_app* app, int32_t cmd) {
         } else {
             g_window_state.serial++;  // al volver de segundo plano: el presentador crea el swapchain en la nueva
         }
+#ifdef MHRISE_LUA_DEBUG
+    } else if (cmd == APP_CMD_LOST_FOCUS) {
+        forget_held_keys();  // (their releases go to the window that took the focus: the menu, the MOD UI)
+#endif
     } else if (cmd == APP_CMD_TERM_WINDOW && g_cfg.native_window) {
         // Android destruye la ventana en cuanto volvemos de aquí: el presentador tiene que soltarla antes (como mucho
         // 1,5 s, para no bloquear la app; presenta cada 33 ms).
@@ -878,6 +890,86 @@ void* text_asker(void*) {
     }
     return nullptr;
 }
+
+// The MOD UI's controller hotkey: mod_ui_hotkey in mhr.ini, Android key codes joined by "+" (L3 + R3 when it isn't
+// there, as in REFramework; 0 for none). The press that completes it opens the MOD UI instead of reaching the game, and
+// the buttons the game sees are let go, since their releases go to the MOD UI's window while it's open (ModUi.java
+// closes it with the same keys).
+#ifdef MHRISE_LUA_DEBUG
+std::vector<int32_t> g_hotkey;
+long long g_hotkey_stamp = -1;
+std::vector<int32_t> g_held_keys, g_hotkey_swallowed;
+
+void read_hotkey() {
+    const long long stamp = nnsdk::ini::stamp();
+    if (stamp == g_hotkey_stamp) return;
+    g_hotkey_stamp = stamp;
+    g_hotkey = {AKEYCODE_BUTTON_THUMBL, AKEYCODE_BUTTON_THUMBR};
+    const auto values = nnsdk::ini::read();
+    const auto it = values.find("mod_ui_hotkey");
+    if (it == values.end()) return;
+    g_hotkey.clear();
+    for (const char* p = it->second.c_str(); *p;) {
+        char* end = nullptr;
+        const long key = strtol(p, &end, 10);
+        if (end == p) break;
+        if (key > 0) g_hotkey.push_back(static_cast<int32_t>(key));
+        p = *end == '+' ? end + 1 : end;
+    }
+}
+
+void* mod_ui_toggler(void*) {
+    pthread_setname_np(pthread_self(), "MOD UI");
+    JNIEnv* env = nullptr;
+    JavaVMAttachArgs attach{JNI_VERSION_1_6, "MOD UI", nullptr};
+    if (g_activity && g_activity->vm->AttachCurrentThread(&env, &attach) == JNI_OK && env) {
+        jclass cls = env->GetObjectClass(g_activity->clazz);
+        jmethodID toggle = cls ? env->GetMethodID(cls, "toggleModUi", "()V") : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear(), toggle = nullptr;
+        if (toggle) {
+            env->CallVoidMethod(g_activity->clazz, toggle);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        g_activity->vm->DetachCurrentThread();
+    }
+    return nullptr;
+}
+
+void forget_held_keys() { g_held_keys.clear(); }
+
+bool mod_ui_hotkey(AInputEvent* event) {
+    if (AInputEvent_getDeviceId(event) <= 0) return false;  // (not adb's virtual keys)
+    const int32_t key = AKeyEvent_getKeyCode(event), action = AKeyEvent_getAction(event);
+    auto erase = [](std::vector<int32_t>& v, int32_t k) {
+        const auto it = std::find(v.begin(), v.end(), k);
+        if (it == v.end()) return false;
+        v.erase(it);
+        return true;
+    };
+    if (action == AKEY_EVENT_ACTION_UP) {
+        erase(g_held_keys, key);
+        return erase(g_hotkey_swallowed, key);
+    }
+    if (action != AKEY_EVENT_ACTION_DOWN) return false;
+    if (AKeyEvent_getRepeatCount(event) > 0)
+        return std::find(g_hotkey_swallowed.begin(), g_hotkey_swallowed.end(), key) != g_hotkey_swallowed.end();
+    erase(g_hotkey_swallowed, key);
+    if (std::find(g_held_keys.begin(), g_held_keys.end(), key) == g_held_keys.end()) g_held_keys.push_back(key);
+    read_hotkey();
+    if (g_hotkey.empty() || std::find(g_hotkey.begin(), g_hotkey.end(), key) == g_hotkey.end()) return false;
+    for (int32_t k : g_hotkey)
+        if (std::find(g_held_keys.begin(), g_held_keys.end(), k) == g_held_keys.end()) return false;
+    g_held_keys.clear();
+    g_hotkey_swallowed.push_back(key);
+    g_key_buttons = 0;
+    publish();
+    printf("[entrada] MOD UI hotkey\n");
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, mod_ui_toggler, nullptr) == 0) pthread_detach(thread);
+    return true;
+}
+
+#endif
 
 void ask_text(NnsdkText*) {
     pthread_t thread;

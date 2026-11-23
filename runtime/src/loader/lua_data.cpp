@@ -252,8 +252,7 @@ std::vector<fs::path> mod_lua::framework_roots(const fs::path &private_root) {
   return roots;
 }
 
-void mod_lua::open_data(lua_State *L, const std::filesystem::path &root) {
-  const auto roots = framework_roots(root);
+void mod_lua::open_data(lua_State *L, const std::filesystem::path &root, const std::vector<fs::path> &roots) {
   auto add = [&](const char *name, Op op) {
     lua_pushinteger(L, static_cast<int>(op));
     lua_pushstring(L, root.c_str());

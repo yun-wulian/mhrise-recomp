@@ -41,7 +41,10 @@ template<class T> class ResourceSlots {
     using Slot = typename ResourceRef<T>::Slot;
     std::deque<Slot> slots_;
     std::vector<Slot*> free_;
+    inline static std::atomic<uint64_t> retirements_{0};
 public:
+    // Descriptor snapshots retain references whose slot can be invalidated independently of the pool.
+    static uint64_t retirements() { return retirements_.load(std::memory_order_acquire); }
     ResourceRef<T> insert(T* value) {
         Slot* slot;
         if (free_.empty()) slot = &slots_.emplace_back();
@@ -53,6 +56,7 @@ public:
         Slot& slot = *ref.slot_;
         slot.generation.fetch_add(1, std::memory_order_release);
         slot.value.store(nullptr, std::memory_order_release);
+        retirements_.fetch_add(1, std::memory_order_release);
         free_.push_back(&slot);
     }
 };

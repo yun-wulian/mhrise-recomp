@@ -226,6 +226,7 @@ void nvn::Texture::note_mapping_change(size_t first, size_t last) {
         remapped_ranges.erase(it + 1, next);
     }
     __atomic_store_n(&mapping_changed, true, __ATOMIC_RELEASE);
+    g_mapping_serial.fetch_add(1, std::memory_order_release);
 }
 
 void nvn::TextureRegistry::restore_mapping_changes(Texture& t, const std::vector<Texture::MappingRange>& ranges) {
@@ -334,6 +335,7 @@ void nvn::TextureRegistry::unbind(const void* key) {
     if (auto last = detach(key)) slots_.erase(last->ref);
 }
 std::atomic<uint32_t> nvn::g_texel_writes{0};
+std::atomic<uint64_t> nvn::g_mapping_serial{0};
 
 std::mutex& nvn::texel_writes_mutex() {
     static std::mutex m;

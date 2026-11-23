@@ -66,6 +66,7 @@ if [ "$LUA_LAB" = 1 ]; then NOTICE_ARGS+=("$BUILD/_deps"); fi
 python3 "$ROOT/tools/apk_notices.py" "$STAGE/assets/licenses" "${NOTICE_ARGS[@]}"
 # The Citrus curves for Steam saves (SaveData.java)
 cp "$ROOT/android/assets/citrus_curves.bin" "$STAGE/assets/"
+if [ "$LUA_LAB" = 1 ]; then echo 1 > "$STAGE/assets/lua_build"; fi
 "$BT/aapt2" compile --dir "$ROOT/android/res" -o "$STAGE/res.zip"
 MANIFEST="$ROOT/android/AndroidManifest.xml" RENAME=()
 if [ -n "$PACKAGE" ]; then

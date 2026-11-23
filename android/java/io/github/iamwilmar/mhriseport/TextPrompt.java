@@ -39,7 +39,7 @@ final class TextPrompt {
     TextPrompt(GameActivity activity, boolean chinese) {
         this.activity = activity;
         this.chinese = chinese;
-        this.scale = SettingsMenu.menuScale(activity) / 100f;
+        this.scale = SettingsMenu.sizeFactor(activity);
     }
 
     void show(String header, String guide, String initial, String error, int minLength, int maxLength, boolean password,

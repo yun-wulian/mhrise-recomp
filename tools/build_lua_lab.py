@@ -11,7 +11,8 @@ from mod_archive_dependency import prepare as prepare_mod_archives
 
 
 RENDERER_ENTRY = "lib/arm64-v8a/libnnsdk.so"
-SETUP_CLASSES = ("SetupActivity", "DumpScanner", "SettingsMenu")
+LOADER_ENTRY = "lib/arm64-v8a/libnier.so"
+SETUP_CLASSES = ("SetupActivity", "DumpScanner")
 
 
 def run(*args):
@@ -40,8 +41,7 @@ def build_renderer(source, cmake, android_options, translator=None):
     return build/"libnnsdk.so"
 
 
-def replace_entries(baseline, base, replacements, license_entries=None):
-    license_entries = license_entries or {}
+def replace_entries(baseline, base, replacements, extra_entries):
     with ZipFile(baseline) as original, ZipFile(base, "w") as apk:
         for name in replacements:
             original.getinfo(name)
@@ -52,11 +52,11 @@ def replace_entries(baseline, base, replacements, license_entries=None):
                 or name.startswith("META-INF/SIG-")
             ):
                 continue
-            if entry.filename in license_entries:
+            if entry.filename in extra_entries:
                 continue
             data = replacements[entry.filename].read_bytes() if entry.filename in replacements else original.read(entry)
             apk.writestr(entry, data)
-        for name, data in license_entries.items():
+        for name, data in extra_entries.items():
             apk.writestr(name, data, compress_type=ZIP_DEFLATED)
 
 def build_dex(root, staging, platform, tools, jdk, release=False):
@@ -144,6 +144,13 @@ def main():
             "-DCMAKE_CXX_FLAGS=--driver-mode=g++", "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-30",
             "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Release"]
         renderer = build_renderer(args.renderer_source.resolve(), cmake, android_options, args.shader_translator)
+    if not args.baseline_apk or args.settings_update:
+        run(cmake/"cmake.exe", "-S", root/"runtime", "-B", build, *android_options,
+            "-DMHRISE_LUA_DEBUG=ON", "-DMHRISE_LOADER_ONLY=ON")
+        hooks = ("hook_impl", "file_redirect_hook", "main_hook", "gsl_alloc_hook")
+        targets = ("nier",) if args.settings_update else ("nier", "nier_loader")
+        run(cmake/"cmake.exe", "--build", build, "--target", *targets,
+            *(hooks if args.source_release else ()), "--parallel", "12")
     target.parent.mkdir(parents=True, exist_ok=True)
     if args.baseline_apk:
         with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
@@ -152,20 +159,19 @@ def main():
             replacements = {} if java_only else {RENDERER_ENTRY: renderer}
             if java_only or args.settings_update:
                 from merge_android_classes import merge_classes
-                families = ("TouchPad",) if args.touch_panel_only else SETUP_CLASSES
+                families = ("TouchPad", "Controls") if args.touch_panel_only else SETUP_CLASSES
                 if args.settings_update:
-                    families += ("GameActivity", "SaveFiles", "BugReport", "TextPrompt")
+                    families += ("SettingsMenu", "GameActivity", "SaveFiles", "BugReport", "TextPrompt",
+                                 "TouchPad", "Controls", "ModFiles", "ModUi", "DriverActivity")
+                    replacements[LOADER_ENTRY] = build/"libnier.so"
                 dex = build_dex(root, staging, platform, tools, jdk)
                 replacements["classes.dex"] = merge_classes(root, staging, args.baseline_apk, dex, jdk, families)
-            license_entries = {"assets/licenses/" + name: data for name, data in notices().items()}
-            replace_entries(args.baseline_apk, base, replacements, license_entries)
+            extras = {"assets/licenses/" + name: data for name, data in notices().items()}
+            if args.settings_update:
+                extras["assets/lua_build"] = b"1\n"
+            replace_entries(args.baseline_apk, base, replacements, extras)
             sign_apk(base, tools, signer, args.keystore, target)
         return
-    run(cmake/"cmake.exe", "-S", root/"runtime", "-B", build, *android_options,
-        "-DMHRISE_LUA_DEBUG=ON", "-DMHRISE_LOADER_ONLY=ON")
-    hooks = ("hook_impl", "file_redirect_hook", "main_hook", "gsl_alloc_hook")
-    run(cmake/"cmake.exe", "--build", build, "--target", "nier", "nier_loader",
-        *(hooks if args.source_release else ()), "--parallel", "12")
     with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
         staging = Path(tmp)
         build_dex(root, staging, platform, tools, jdk, release=args.source_release)
@@ -174,7 +180,6 @@ def main():
         run(tools/"aapt2.exe", "link", "--manifest", root/"android/AndroidManifest.xml", "-I", platform,
             "-R", staging/"res.zip", "--auto-add-overlay", *([] if args.source_release else ["--debug-mode"]), "--rename-manifest-package",
             "io.github.iamwilmar.mhriseport.lab", "-o", base)
-        loader = "lib/arm64-v8a/libnier.so"
         license_entries = {"assets/licenses/" + name: data for name, data in
                            notices(vendor=args.renderer_source / "third_party", lua_deps=build / "_deps").items()}
         with ZipFile(base, "a", ZIP_DEFLATED) as apk:
@@ -186,9 +191,10 @@ def main():
             else:
                 with ZipFile(args.release_apk) as original:
                     for name in original.namelist():
-                        if name.startswith(("assets/", "lib/")) and name not in (loader, RENDERER_ENTRY) and name not in license_entries:
+                        if name.startswith(("assets/", "lib/")) and name not in (LOADER_ENTRY, RENDERER_ENTRY, "assets/lua_build") and name not in license_entries:
                             apk.writestr(name, original.read(name))
-            apk.write(build/"libnier.so", loader)
+            apk.writestr("assets/lua_build", b"1\n")
+            apk.write(build/"libnier.so", LOADER_ENTRY)
             apk.write(staging/"lib/arm64-v8a/libarchive-jni.so", "lib/arm64-v8a/libarchive-jni.so")
             apk.write(renderer, RENDERER_ENTRY)
             apk.write(staging/"classes.dex", "classes.dex")

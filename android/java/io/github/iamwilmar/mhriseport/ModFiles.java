@@ -72,6 +72,15 @@ final class ModFiles {
         return true;
     }
 
+    // What a change to this mod needs: game files only load when the game starts; scripts reload in place
+    static boolean gameFiles(File dir) {
+        return new File(dir, "romfs").isDirectory() || new File(dir, "exefs").isDirectory();
+    }
+
+    static boolean scripts(File dir) {
+        return new File(dir, "reframework").isDirectory();
+    }
+
     static synchronized boolean delete(Mod m) {
         return deleteTree(m.dir);
     }
@@ -181,14 +190,14 @@ final class ModFiles {
         PcLooseMod.prepareSlots(data);
     }
 
-    static String importArchive(ContentResolver cr, Uri uri, File data) throws IOException {
+    static ImportResult importArchive(ContentResolver cr, Uri uri, File data) throws IOException {
         try (InputStream in = cr.openInputStream(uri)) {
             if (in == null) throw new IOException("Cannot open archive");
             return importArchive(in, displayName(cr, uri), data);
         }
     }
 
-    static synchronized String importArchive(InputStream source, String filename, File data) throws IOException {
+    static synchronized ImportResult importArchive(InputStream source, String filename, File data) throws IOException {
         File mods = modsDir(data);
         Files.createDirectories(mods.toPath());
         File work = Files.createTempDirectory(mods.toPath(), ".import-").toFile();
@@ -201,7 +210,18 @@ final class ModFiles {
         }
     }
 
-    static String installUnpacked(Map<String, File> files, String filename, File data, File work) throws IOException {
+    static final class ImportResult {
+        final String description;
+        final boolean gameFiles, scripts;
+
+        ImportResult(String description, boolean gameFiles, boolean scripts) {
+            this.description = description;
+            this.gameFiles = gameFiles;
+            this.scripts = scripts;
+        }
+    }
+
+    static ImportResult installUnpacked(Map<String, File> files, String filename, File data, File work) throws IOException {
         File dest = freeDir(data, folderName(filename, "Mod"));
         File staged = new File(work, "ready");
         Files.createDirectory(staged.toPath());
@@ -234,9 +254,8 @@ final class ModFiles {
                         Long.toString(PcLooseMod.nextOrder(data)).getBytes(StandardCharsets.UTF_8));
             description += (description.isEmpty() ? "" : ", ") + scripts + " Lua/data files";
         }
-        description += ". Restart the game";
         Files.move(staged.toPath(), dest.toPath());
-        return "\"" + dest.getName() + "\": " + description;
+        return new ImportResult("\"" + dest.getName() + "\": " + description, gameFiles(dest), scripts(dest));
     }
 
     private static int stageFramework(Map<String, File> files, File staged) throws IOException {

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstring>
 #include <lua.hpp>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -38,6 +39,7 @@ char callbacks_key;
 std::atomic<lua_State *> active{};
 std::recursive_mutex mutex;
 bool attached = false;
+std::string loading_script;
 // Each state owns its registry references. Failed loads can discard just their
 // registrations.
 void list(lua_State *L) { lua_rawgetp(L, LUA_REGISTRYINDEX, &callbacks_key); }
@@ -65,6 +67,10 @@ int add_callback(lua_State *L) {
   lua_rawseti(L, -2, 2);
   lua_pushvalue(L, fn);
   lua_rawseti(L, -2, 3);
+  if (!loading_script.empty()) {
+    lua_pushstring(L, loading_script.c_str());
+    lua_rawseti(L, -2, 5);
+  }
   lua_rawseti(L, -2, pos);
   return 0;
 }
@@ -75,6 +81,10 @@ void fire(lua_State *L, Phase phase, int index) {
   list(L);
   const int table = lua_gettop(L);
   const size_t count = lua_rawlen(L, table);
+  // The MOD UI puts each script's controls under a header with its name (a script that draws its own header too
+  // just gets nested in it); a closed header skips that script's drawing
+  std::string section;
+  bool section_open = true;
   for (size_t k = 1; k <= count; ++k) {
     lua_rawgeti(L, table, k);
     const int record = lua_gettop(L);
@@ -84,19 +94,39 @@ void fire(lua_State *L, Phase phase, int index) {
                  lua_tointeger(L, -1) == index;
     lua_pop(L, 2);
     if (match) {
+      const char *script = nullptr;
+      if (phase == Phase::Ui) {
+        lua_rawgeti(L, record, 5);
+        script = lua_tostring(L, -1);  // (stays valid: the record holds it)
+        lua_pop(L, 1);
+        if (script && section != script) {
+          section = script;
+          section_open = script_section(script);
+        }
+        if (script && !section_open) {
+          lua_pop(L, 1);
+          continue;
+        }
+      }
       lua_rawgeti(L, record, 3);
       if (lua_isfunction(L, -1)) {
-        if ((phase == Phase::Ui || phase == Phase::Frame ? call_ui_callback(L)
+        if ((phase == Phase::Ui || phase == Phase::Frame ? call_ui_callback(L, script)
                                 : lua_pcall(L, 0, 0, 0)) != LUA_OK) {
           lua_rawgeti(L, record, 4);
           bool repeated = lua_rawequal(L, -1, -2);
           lua_pop(L, 1);
           const char *msg = lua_tostring(L, -1);
-          if (!repeated)
+          if (!repeated) {
             log_message(ANDROID_LOG_ERROR,
                         msg ? msg : "Lua event callback failed");
+            mod_lua::script_error(msg ? msg : "Lua event callback failed");
+          }
           lua_rawseti(L, record, 4);
         } else {
+          lua_rawgeti(L, record, 4);
+          if (const char *was = lua_tostring(L, -1))
+            script_error_over(was);  // (it ran clean this time)
+          lua_pop(L, 1);
           lua_pushnil(L);
           lua_rawseti(L, record, 4);
         }
@@ -136,6 +166,7 @@ void observe(int index) {
 }
 } // namespace
 std::recursive_mutex &lua_mutex() { return mutex; }
+void set_loading_script(const std::string &name) { loading_script = name; }
 void select_event_state(lua_State *L, FrameGc *gc) {
   std::lock_guard lock(mutex);
   for (auto &entry : entries) entry.before = entry.after = false;

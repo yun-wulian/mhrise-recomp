@@ -587,6 +587,13 @@ private:
             snprintf(lines[n].text, sizeof lines[n].text, "SHADERS %d", std::max(building, 0));
             lines[n++].color = building > 0 ? kWarn : kDim;
         }
+        // Debug → Detailed log or GPU breadcrumbs left on: the game runs at a third of its speed or less with either,
+        // which looks like stutter and a low frame rate. Said here, so it isn't taken for the port being slow.
+        if (n < kStatsLines && (NVN_FLAG("verbose_log") || NVN_FLAG("breadcrumbs") || NVN_FLAG("breadcrumbs_compute") ||
+                                NVN_FLAG("breadcrumbs_light"))) {
+            snprintf(lines[n].text, sizeof lines[n].text, "DEBUG ON  SLOW");
+            lines[n++].color = kBad;
+        }
         size_t longest = 0;
         for (int k = 0; k < n; k++) longest = std::max(longest, strlen(lines[k].text));
         const int w = std::min<int>(kStatsW, static_cast<int>(longest) * 12 - 2 + 2 * kStatsPad);

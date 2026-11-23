@@ -474,7 +474,7 @@ public final class DriverActivity extends Activity {
 
     private float scale = -1;  // (el tamaño del menú de ajustes, el mismo aquí)
     private float scale() {
-        if (scale < 0) scale = SettingsMenu.menuScale(this) / 100f;
+        if (scale < 0) scale = SettingsMenu.sizeFactor(this);
         return scale;
     }
 

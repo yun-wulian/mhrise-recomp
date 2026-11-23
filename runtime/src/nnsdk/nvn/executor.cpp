@@ -2445,6 +2445,19 @@ private:
     uint64_t prof_render_passes_ = 0, prof_writebacks_ = 0, prof_dispatches_ = 0;
     uint64_t prof_bindless_sets_ = 0, prof_bindless_textures_ = 0, prof_bindless_us_ = 0;  // set 1 armados, sus texturas
     uint64_t prof_bindless_reused_ = 0;
+    // The bindless memo: the set a draw's set 1 resolved to, by everything that decides it (the layout, the pools, the
+    // handle words in the game's uniform buffers, the attachments), for the rest of the submit. Resolving each handle
+    // and checking its texture on every draw cost ~4.5 ms a frame in the busy parts of the village (1,700 draws); most
+    // draws there repeat the set of a draw before them. It holds while no texture was uploaded, created or remapped
+    // and no texel write or deferred clear is pending (texture_events_, g_mapping_serial), and isn't kept for a set
+    // that samples an attachment (that one is a snapshot copy made for the draw).
+    struct BindlessMemo {
+        uint64_t hash = 0, epoch = 0, events = 0, mapping = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    std::array<BindlessMemo, 256> bindless_memo_{};
+    uint64_t texture_events_ = 0;
+    uint64_t prof_bindless_memo_ = 0;
     // Perfil fino (con registro, en los frames medidos como prof_mark; por frame medido en "perfil fino"): lo que los tramos
     // juntan. Huellas de las texturas que sube la CPU (cpu_texture_changed), de la caché de vértices y de los overlays;
     // búsquedas de memory pools (index_window: cada multi-draw); sets 0 de los draws (reutilizados por el del draw anterior,
@@ -3271,6 +3284,7 @@ void Executor::write_stamps(InFlight& f) {
 
 void Executor::retire_texture(Texture& t) {
     std::lock_guard lock(g_mutex);
+    ++texture_events_;
     if (auto it = feedback_copies_.find(&t); it != feedback_copies_.end()) {
         retire_texture(it->second.texture);
         feedback_copies_.erase(it);
@@ -3305,6 +3319,7 @@ void Executor::retire_texture(Texture& t) {
 
 void Executor::retire_sampler(VkSampler s) {
     std::lock_guard lock(g_mutex);
+    ++texture_events_;
     Retired r;
     r.sampler = s;
     r.submit = submitted_.load(std::memory_order_relaxed) + 1;  // como las texturas
@@ -3585,7 +3600,9 @@ bool Executor::run(const std::vector<const CommandList*>& lists) {
     buffer_cache_.set_generations(generations_);
     prof_count_stage_keys_ = NVN_FLAG("verbose_log");
     per_stage_keys_ = NVN_FLAG("pipelines_per_stage");
-    prof_timing_ = frame_ % kProfileEvery == 0 && NVN_FLAG("verbose_log");  // los tiempos por draw, solo depurando
+    // The per-draw times (one frame in kProfileEvery, a few clock reads per draw): with the detailed log, and with
+    // Performance stats too, since where the executor's time goes in a heavy spot is what those reports are for
+    prof_timing_ = frame_ % kProfileEvery == 0 && (NVN_FLAG("verbose_log") || NVN_FLAG("perf_stats"));
     if (prof_timing_ && prof_timed_frame_ != frame_) prof_timed_frame_ = frame_, prof_timed_frames_++;
     buffer_cache_.prof = prof_timing_ ? &fine_.vtx : nullptr;
     read_flags();
@@ -4026,6 +4043,7 @@ void Executor::apply(const Command& c) {
 bool Executor::ensure_image(Texture& t, VkCommandBuffer cmd) {
     if (t.image) return true;
     if (t.vk_failed || frame_ < t.retry_frame) return false;
+    ++texture_events_;
     LoadTimer timer(*this, kLdImage);
     VkContext* c = vk();
     const FormatInfo* f = format_info(t.desc.format);
@@ -4599,6 +4617,7 @@ bool Executor::decode_level(Texture& t, const LevelLayout& lv, const uint8_t* bl
 
 void Executor::upload(Texture& t) {
     if (!t.storage || !t.image) return;
+    ++texture_events_;
     LoadTimer timer(*this, kLdUpload, t.layout.total_size());
     if (std::find(frame_uploads_.begin(), frame_uploads_.end(), &t) == frame_uploads_.end()) frame_uploads_.push_back(&t);
     if (!t.uploaded) prof_texture_bytes_ += t.layout.total_size();  // DEPURACIÓN: memoria de texturas subidas
@@ -5848,6 +5867,7 @@ bool Executor::apply_texel_writes(Texture& t) {
         writes.swap(t.texel_writes);
         g_texel_writes -= static_cast<uint32_t>(writes.size());
     }
+    ++texture_events_;
     // Sus cajas ya dicen qué cambia: sin vigilancia (cada WriteTexels saltaría en cada página; un frame de vídeo, en todas).
     if (!t.gpu_levels) t.no_watch = true, t.watched = false;
     if (!t.image || !t.storage) return true;  // la subida al crearla ya lo lleva
@@ -6261,6 +6281,7 @@ bool Executor::resolve_handle(uint32_t word, const Resource& r, Texture*& tex, T
 }
 
 bool Executor::apply_mapping_changes(Texture& t) {
+    ++texture_events_;
     auto ranges = g_textures.take_mapping_changes(t);
     if (!t.gpu_levels) {
         if (t.uploaded && !remap_matches_image(t, ranges, prof_full_hash_bytes_)) t.uploaded = false;
@@ -6564,6 +6585,67 @@ VkDescriptorSet Executor::bindless_set(const ProgramStage* const* stages, VkDesc
         handle_samplers_ = samplers;
         ++handle_pool_epoch_;
     }
+    // The memo (bindless_memo_): its key, from what the resolution below reads
+    const bool memo_ok = !trace && !loading_armed_ && pending_clears_.empty() &&
+                         g_texel_writes.load(std::memory_order_acquire) == 0 && !NVN_FLAG("no_bindless_memo");
+    uint64_t memo_hash = 0;
+    const uint64_t memo_mapping = g_mapping_serial.load(std::memory_order_acquire);
+    if (memo_ok) {
+        uint64_t h = 0x9E3779B97F4A7C15ull;
+        auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001B3ull + (h >> 29); };
+        mix(reinterpret_cast<uint64_t>(layout));
+        mix(uint64_t{bindless_});
+        mix(handle_pool_epoch_);
+        mix(ResourceSlots<Texture>::retirements());
+        mix(ResourceSlots<Sampler>::retirements());
+        mix(submit_index_);  // watched CPU writes are collected once per NVN submit
+        if (attachments) {
+            mix(static_cast<uint64_t>(attachments->count));
+            for (int i = 0; i < attachments->count; i++) {
+                mix(reinterpret_cast<uint64_t>(attachments->colors[i].get()));
+                mix(hash_bytes(&attachments->color_views[i], sizeof attachments->color_views[i]));
+            }
+            mix(reinterpret_cast<uint64_t>(attachments->depth.get()));
+            mix(hash_bytes(&attachments->depth_view, sizeof attachments->depth_view));
+        }
+        for (int s = 0; s < kStages; s++) {
+            if (!stages[s] || !stages[s]->shader.has_bindless_set) continue;
+            for (const Resource& r : stages[s]->shader.resources) {
+                if (r.set != nvnshader::kBindlessSet) continue;
+                const BufferRange u = ubo_of(s, r);
+                mix(u.address);
+                mix(u.size);
+                mix(uint64_t{r.binding} | uint64_t{r.count} << 32);
+                mix(uint64_t{r.cbuf_offset} | uint64_t{r.size_shift} << 32 | uint64_t{r.shift_left} << 40 |
+                    uint64_t{r.texture_type} << 48);
+                mix(uint64_t{r.handle_and_mask} | uint64_t{r.handle_or} << 32);
+                // the handle words themselves (the game rewrites a buffer in place between draws)
+                const uint64_t first_end = uint64_t{r.cbuf_offset} + sizeof(uint32_t);
+                if (bindless_ && u.address && u.size >= first_end) {
+                    const uint64_t last = r.size_shift < 64 ? (u.size - first_end) >> r.size_shift : 0;
+                    const uint32_t readable = static_cast<uint32_t>(std::min<uint64_t>(r.count, last + 1));
+                    for (uint32_t k = 0; k < readable; k++) {
+                        uint32_t word;
+                        memcpy(&word, reinterpret_cast<const void*>(u.address + r.cbuf_offset + (uint64_t{k} << (r.size_shift & 63))),
+                               sizeof word);
+                        mix(word);
+                    }
+                }
+            }
+        }
+        memo_hash = h;
+        const BindlessMemo& m = bindless_memo_[(memo_hash >> 7) % bindless_memo_.size()];
+        if (m.hash == memo_hash && m.epoch == descriptor_epoch_ && m.events == texture_events_ && m.mapping == memo_mapping &&
+            m.set) {
+            prof_bindless_memo_++;
+            return m.set;
+        }
+    }
+    bool reusable = true;
+    auto remember = [&](VkDescriptorSet set) {
+        if (!memo_ok || !reusable || !set || !pending_clears_.empty()) return;
+        bindless_memo_[(memo_hash >> 7) % bindless_memo_.size()] = {memo_hash, descriptor_epoch_, texture_events_, memo_mapping, set};
+    };
     uint64_t resolved = 0;
     for (int s = 0; s < kStages; s++) {
         if (!stages[s] || !stages[s]->shader.has_bindless_set) continue;
@@ -6631,8 +6713,10 @@ VkDescriptorSet Executor::bindless_set(const ProgramStage* const* stages, VkDesc
                 if (resolve_handle(word, r, t, v, smp, textures.get(), samplers.get())) {
                     if (!prepare_shader_view(*t, v, ViewUse::Sampled)) return VK_NULL_HANDLE;
                     if (attachments && t->image) {
+                        Texture* source = t;
                         t = sample_source(*t, v, ViewUse::Sampled, *attachments);
                         if (!t) return VK_NULL_HANDLE;
+                        if (t != source) reusable = false;  // this draw's attachment snapshot
                     }
                     found += repeats;
                     if (trace && found <= 6) {
@@ -6644,6 +6728,7 @@ VkDescriptorSet Executor::bindless_set(const ProgramStage* const* stages, VkDesc
                     }
                 }
                 const VkImageView resolved_view = t && t->image ? view(*t, v, ViewUse::Sampled) : VK_NULL_HANDLE;
+                if (t && !resolved_view) reusable = false;  // retry a failed image or view allocation
                 const VkImageView iv = resolved_view ? resolved_view : missing;
                 if (loading_armed_ && attachments && t && iv && iv != missing)
                     check_loading_binding(*t, v, iv, s, r, k, smp);
@@ -6664,6 +6749,7 @@ VkDescriptorSet Executor::bindless_set(const ProgramStage* const* stages, VkDesc
     const uint64_t hash = hash_bytes(key.data(), key.size() * sizeof(uint64_t), reinterpret_cast<uint64_t>(layout));
     if (VkDescriptorSet cached = sets_cache_.find(descriptor_epoch_, layout, key, hash)) {
         prof_bindless_reused_++;
+        remember(cached);
         return cached;
     }
     VkDescriptorSet set = descriptor_set(layout);
@@ -6693,6 +6779,7 @@ VkDescriptorSet Executor::bindless_set(const ProgramStage* const* stages, VkDesc
     }
     vkUpdateDescriptorSets(vk()->device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     sets_cache_.insert(descriptor_epoch_, layout, key, hash, set);
+    remember(set);
     prof_bindless_sets_++;
     prof_bindless_textures_ += resolved;
     prof_bindless_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -11765,12 +11852,12 @@ void Executor::profile_frame() {
         bindless_layouts = bindless_layouts_.size();
     }
     NVN_LOG("perfil bindless: %.1f sets del set 1 armados por frame (%.2f ms cada uno), %.1f texturas del juego por set; "
-            "%zu layouts; %.1f sets por frame reutilizados por contenido\n",
+            "%zu layouts; %.1f sets por frame reutilizados por contenido, %.1f from the submit's memo\n",
             prof_bindless_sets_ / double(period),
             prof_bindless_sets_ ? prof_bindless_us_ / 1000.0 / double(prof_bindless_sets_) : 0.0,
             prof_bindless_sets_ ? prof_bindless_textures_ / double(prof_bindless_sets_) : 0.0, bindless_layouts,
-            prof_bindless_reused_ / double(period));
-    prof_bindless_sets_ = prof_bindless_textures_ = prof_bindless_us_ = prof_bindless_reused_ = 0;
+            prof_bindless_reused_ / double(period), prof_bindless_memo_ / double(period));
+    prof_bindless_sets_ = prof_bindless_textures_ = prof_bindless_us_ = prof_bindless_reused_ = prof_bindless_memo_ = 0;
     {  // los espejos que más suben (en una cacería, ~26 MB/frame entre todos: ¿cuál y de qué tamaño?)
         std::vector<std::pair<uint64_t, uint64_t>> top;  // (bytes, dirección)
         for (auto& [a, b] : prof_mirror_top_) top.push_back({b, a});
