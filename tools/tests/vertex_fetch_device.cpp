@@ -8,6 +8,7 @@
 using namespace nvn;
 extern "C" {
 int nvnMemoryPoolInitialize(void*, const void*);
+void nvnMemoryPoolFinalize(void*);
 void nvnTextureBuilderSetDefaults(TextureDesc*);
 int nvnTextureInitialize(void*, const TextureDesc*);
 void nvnTextureReadTexels(const void*, const TextureViewDesc*, const CopyRegion*, void*);
@@ -158,6 +159,91 @@ bool add_compute(Program& program, const char* path, std::initializer_list<nvnsh
     cs.tried = true;
     cs.spirv_id = spirv_identity(cs.shader);
     return create_shader_module(vk()->device, cs.shader.spirv, &cs.module) == VK_SUCCESS;
+}
+
+// Both producers leave different parts of one index window current. The indirect args and
+// count live on the GPU. A known count (direct draw) provides the same triangle as a control.
+bool indirect_indices(Program& paint, const cmd::SetRenderTargets& target, void* texture, Program& copy,
+                      uint32_t* pool, size_t pool_bytes, uint32_t prefix) {
+    constexpr uint32_t first = 62, cut = 64, end = 65;
+    uint32_t pool_key;
+    struct { void* device; void* storage; size_t size; int flags; } builder{nullptr, pool, pool_bytes, 0};
+    if (pool_bytes && !nvnMemoryPoolInitialize(&pool_key, &builder)) return false;
+    alignas(256) std::array<uint32_t, end> original{};
+    original[first + 1] = 1;
+    original[first + 2] = 2;
+    alignas(256) uint32_t args[] = {3, 1, 0, 0, 0};
+    alignas(256) uint32_t gpu_args[5]{}, gpu_count{};
+    constexpr Words color{11, 22, 33, 44};
+    const Words vertices[]{color, color, color};
+    const BufferRange vb{uintptr_t(vertices), sizeof(vertices)};
+    const VertexStreamState stream{sizeof(Words), 0};
+    VertexAttribState attrs[5]{};
+    attrs[4].format = 0x2f;
+    auto no_spill = [](size_t) -> void* { std::abort(); };
+    CommandList list;
+    auto write = [&](const uint32_t* from, uint32_t* to, unsigned words) {
+        list.commands.emplace_back(cmd::BindProgram{&copy, 32});
+        list.commands.emplace_back(cmd::BindStorageBuffer{5, 0, {uintptr_t(from), words * sizeof(uint32_t)}});
+        list.commands.emplace_back(cmd::BindStorageBuffer{5, 1, {uintptr_t(to), words * sizeof(uint32_t)}});
+        list.commands.emplace_back(cmd::Dispatch{int(words), 1, 1});
+        list.commands.emplace_back(cmd::Barrier{~0});
+    };
+    write(args, gpu_args, 5);
+    // The remap compute copies 22-bit values. NVN patches the full-width firstIndex
+    // after that GPU write, including the test whose index data starts past 24 MiB.
+    list.commands.emplace_back(cmd::ClearBuffer{uintptr_t(gpu_args + 2), sizeof(uint32_t), prefix + first});
+    write(args + 1, &gpu_count, 1);
+    list.commands.emplace_back(target);
+    list.commands.emplace_back(cmd::Viewport{0, 0, 0, 16, 8});
+    list.commands.emplace_back(cmd::Scissor{0, 0, 0, 16, 8});
+    list.commands.emplace_back(cmd::ClearColor{0, {}, 15});
+    list.commands.emplace_back(PolygonState{0, 1, 2, 0});
+    list.commands.emplace_back(ColorState{0, 0, 8, 0});
+    list.commands.emplace_back(ChannelMaskState{15});
+    list.commands.emplace_back(cmd::BindVertexAttribs{{attrs, 5, no_spill}});
+    list.commands.emplace_back(cmd::BindVertexStreams{{&stream, 1, no_spill}});
+    list.commands.emplace_back(cmd::BindVertexBuffers{0, {&vb, 1, no_spill}});
+    for (unsigned column = 0; column < 6; ++column) {
+        // Use different windows so an earlier draw cannot supply the missing indices.
+        auto* indices = pool + column * 256 + prefix;
+        std::copy(original.begin(), original.end(), indices);
+        const unsigned start = column % 2 ? cut : 0, stop = column % 2 ? end : cut;
+        std::fill(indices + start, indices + stop, 0u);
+        write(original.data() + start, indices + start, stop - start);
+        cmd::Draw d{4, 2, 3, 0, uintptr_t(indices + first), 0, 0, 1};
+        if (column >= 2) {
+            d.index_address = uintptr_t(indices - prefix);
+            d.count = 0;
+            d.indirect = uintptr_t(gpu_args);
+        }
+        if (column >= 4) { d.draw_count = uintptr_t(&gpu_count); d.max_draws = 1; d.stride = 20; }
+        auto draw_column = [&](unsigned x) {
+            list.commands.emplace_back(cmd::BindProgram{&paint, 3});
+            list.commands.emplace_back(cmd::Scissor{0, int(x), 0, 1, 8});
+            list.commands.emplace_back(d);
+        };
+        draw_column(column);
+        if (column == 5) {
+            write(args + 3, &gpu_count, 1);  // zero active draws
+            draw_column(6);
+            write(args + 1, &gpu_count, 1);  // restore one active draw
+            draw_column(7);
+        }
+    }
+    list.commands.emplace_back(cmd::SetRenderTargets{});
+    execute({&list});
+    wait_idle();
+    const CopyRegion all{0, 0, 0, 16, 8, 1};
+    std::array<Words, 128> pixels{};
+    nvnTextureReadTexels(texture, nullptr, &all, pixels.data());
+    if (pool_bytes) nvnMemoryPoolFinalize(&pool_key);
+    unsigned errors = 0;
+    for (unsigned i = 0; i < pixels.size(); ++i)
+        errors += pixels[i] != (i % 16 < 6 || i % 16 == 7 ? color : Words{});
+    printf("partial GPU index writes, pool %zu bytes, firstIndex %u: %u incorrect pixels\n",
+           pool_bytes, prefix + first, errors);
+    return errors == 0;
 }
 
 bool overlay_windows(Program& paint, const cmd::SetRenderTargets& target, void* texture) {
@@ -348,7 +434,12 @@ bool overlay_windows(Program& paint, const cmd::SetRenderTargets& target, void* 
         large_bad += large_dst[i] != (i < 64 ? (123u ^ 0x13579bdfu) : 123u);
     printf("large mixed-source copy: %u incorrect words\n", large_bad);
     bad += large_bad;
-    return bad == 0;
+    alignas(256) static std::array<uint32_t, (2 << 20) / 4> small{};
+    alignas(256) static std::array<uint32_t, (26 << 20) / 4> large_index_pool{};
+    alignas(256) static std::array<uint32_t, 2048> raw{};
+    return indirect_indices(paint, target, texture, reader, small.data(), sizeof(small), 0) &&
+           indirect_indices(paint, target, texture, reader, large_index_pool.data(), sizeof(large_index_pool), (25 << 20) / 4) &&
+           indirect_indices(paint, target, texture, reader, raw.data(), 0, 0) && bad == 0;
 }
 } // namespace
 extern "C" int bench() {

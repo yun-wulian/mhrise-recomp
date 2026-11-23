@@ -1949,6 +1949,7 @@ private:
         // Envío de Vulkan que lo escribió por última vez; el de la última copia de lectura (al final de un envío que
         // lo escribió, la GPU lo copia a readback) y el último que se devolvió a la memoria del juego.
         uint64_t written = 0, readback_submit = 0, written_back = 0;
+        uint64_t device_update = 0;  // includes copies and patches that do not request guest writeback
         VkBuffer readback = VK_NULL_HANDLE;
         VkDeviceSize readback_offset = 0;
         uint8_t* readback_data = nullptr;
@@ -2023,6 +2024,7 @@ private:
         --it;
         if (address >= it->first + it->second.size) return;
         it->second.written = submitted_.load(std::memory_order_relaxed) + 1;
+        it->second.device_update = it->second.written;
         it->second.writers |= writer;
         note_gpu_write_vs_mirrors(it->first, it->second.size, writer == kWrittenByCompute ? "SSBO de compute" : "SSBO de un draw");
         if (vigilar_nan_) {  // DEPURACIÓN
@@ -2167,7 +2169,10 @@ private:
     // Multi-draw: no se sabe qué índices lee cada draw; su espejo es una ventana del memory pool que empieza en el
     // bloque de 8 MB de la dirección y sigue 24 MB (o hasta el final del pool): todos los de un bloque la comparten.
     static constexpr uint64_t kIndexWindowAlign = 8ull << 20, kIndexWindow = 24ull << 20;
-    bool index_window(uint64_t address, uint64_t* base, uint64_t* size);
+    BufferRange indirect_index_window(uint64_t address, bool multi);
+    uint64_t index_params_visible_ = 0;  // last submission synchronized for host reads of indirect arguments
+    bool materialize_index_parameters(cmd::Draw& draw, size_t bytes, std::vector<uint32_t>& args,
+                                      uint32_t& count, BufferRange& indices);
     // El memory pool que contiene address: [start, start + size). Cada multi-draw lo buscaba dos veces recorriendo
     // g_memory_pools entero (con su mutex; MH Rise reparte sus mallas en decenas de pools de 4 MB, y casi todos sus draws
     // son multi-draw). Los últimos encontrados se recuerdan mientras no se cree ni se destruya ningún pool
@@ -7773,7 +7778,36 @@ void Executor::draw(const cmd::Draw& in) {
     }
     const uint8_t* args_host = nullptr;   // DEPURACIÓN (migas): los argumentos vistos desde la CPU
     const uint8_t* count_host = nullptr;
-    if (d.indirect) {
+    BufferRange window{};
+    std::vector<uint32_t> exact_args;
+    uint32_t exact_count = 0;
+    if (d.indirect && d.index_type >= 1 && d.index_address) {
+        window = indirect_index_window(d.index_address, multi);
+        if (!window.size) {
+            // Without a bounded allocation, only the actual arguments establish which indices
+            // can be fetched. Preserve draw IDs and the command order for counted multi-draws.
+            if (!materialize_index_parameters(d, args_size, exact_args, exact_count, window)) {
+                skip_draw(11);
+                return;
+            }
+            if (!window.size) return;
+            if (multi) d.max_draws = static_cast<int>(exact_count);
+            const size_t active_bytes = multi ? size_t(exact_count - 1) * d.stride + one_args : one_args;
+            auto copy = staging_->alloc_contiguous(active_bytes + sizeof(uint32_t), 16);
+            if (!copy.data) { skip_draw(11); return; }
+            memcpy(copy.data, exact_args.data(), active_bytes);
+            gpu_args = copy.buffer;
+            gpu_args_offset = copy.offset;
+            args_host = copy.data;
+            if (multi && !count_fallback) {
+                memcpy(copy.data + active_bytes, &exact_count, sizeof(exact_count));
+                count_buf = copy.buffer;
+                count_offset = copy.offset + active_bytes;
+                count_host = copy.data + active_bytes;
+            }
+        }
+    }
+    if (d.indirect && exact_args.empty()) {
         if (const Overlay* o = find_overlay(d.indirect, args_size, &gpu_args_offset)) {
             gpu_args = o->buffer;
             if (o->data) args_host = o->data + (gpu_args_offset - o->offset);
@@ -7793,7 +7827,9 @@ void Executor::draw(const cmd::Draw& in) {
     VkBuffer check_buf = VK_NULL_HANDLE;  // the count it reads, and where
     VkDeviceSize check_offset = 0;
     if (multi) {
-        if (const Overlay* o = find_overlay(d.draw_count, 4, &count_offset)) {
+        if (!exact_args.empty()) {
+            multi_draws = exact_count;
+        } else if (const Overlay* o = find_overlay(d.draw_count, 4, &count_offset)) {
             // Without draw-indirect-count, a count no GPU work wrote is the game's own, set on the CPU: read from its
             // memory (below, exactly) rather than drawing every draw up to max_draws
             if (o->writers || !count_fallback) {
@@ -7830,7 +7866,7 @@ void Executor::draw(const cmd::Draw& in) {
                 logged = true;
                 NVN_LOG("multi-draw with the count on the GPU and no VK_KHR_draw_indirect_count: every draw is drawn\n");
             }
-        } else if (!count_buf) {
+        } else if (!count_buf && exact_args.empty()) {
             multi_draws = std::min<uint32_t>(*reinterpret_cast<const uint32_t*>(d.draw_count), static_cast<uint32_t>(d.max_draws));
             if (!multi_draws) return;
         }
@@ -7855,11 +7891,8 @@ void Executor::draw(const cmd::Draw& in) {
             }
         }
         if (frame_ == trace_frame_) {  // DEPURACIÓN: lo que dejó el frame anterior en los argumentos y el número
-            VkDeviceSize ao = 0, co = 0;
-            const Overlay* aa = cpu_args ? nullptr : find_overlay(d.indirect, args_size, &ao);
-            const Overlay* ca = count_buf ? find_overlay(d.draw_count, 4, &co) : nullptr;
-            const auto* a = reinterpret_cast<const uint32_t*>(aa && aa->data ? aa->data + (ao - aa->offset)
-                                                                            : reinterpret_cast<const uint8_t*>(d.indirect));
+            const auto* a = args_host ? reinterpret_cast<const uint32_t*>(args_host)
+                                      : reinterpret_cast<const uint32_t*>(d.indirect);
             std::string args;
             char b[64];
             for (int k = 0; k < std::min(d.max_draws, 3); k++) {
@@ -7868,7 +7901,7 @@ void Executor::draw(const cmd::Draw& in) {
                 args += b;
             }
             NVN_LOG("F   multi-draw: número antes %u, argumentos antes%s\n",
-                    ca && ca->data ? *reinterpret_cast<const uint32_t*>(ca->data + (co - ca->offset)) : multi_draws, args.c_str());
+                    count_host ? *reinterpret_cast<const uint32_t*>(count_host) : multi_draws, args.c_str());
         }
         if (frame_ == trace_frame_)  // DEPURACIÓN
             NVN_LOG("F multi-draw %d draws máx. (stride %d), argumentos %s %#llx, número %s %#llx%s, índices %d en %#llx\n",
@@ -8040,13 +8073,7 @@ void Executor::draw(const cmd::Draw& in) {
     // Overlays de lo que escribe el draw (y de los SSBO que lee y caen solo en parte en lo de la GPU), unidos antes del
     // pase: dentro, make_overlay no puede copiar nada en la GPU.
     prepare_draw_overlays();
-    // Espejos de los SSBO grandes que solo se leen: se revisan (y suben) antes de empezar el pase. Con un multi-draw,
-    // también la ventana de sus índices.
-    if (in.draw_count && (context.draw_indexed_indirect_count || !NVN_FLAG("no_count_fallback"))) {
-        VkDeviceSize off = 0;
-        uint64_t base = 0, size = 0;
-        if (in.index_type >= 1 && in.index_address && index_window(in.index_address, &base, &size)) mirror(base, size, &off);
-    }
+    // Espejos de los SSBO grandes que solo se leen: se revisan (y suben) antes de empezar el pase.
     for (int s = 0; s < kStages; s++) {
         if (!st_.stages[s]) continue;
         const uint32_t base = kGraphicsStorageBase + kGraphicsStorageStride * s;
@@ -8067,13 +8094,23 @@ void Executor::draw(const cmd::Draw& in) {
     const uint32_t isize = indices ? index_size(d.index_type) : 0;
     VkBuffer gpu_index = VK_NULL_HANDLE;  // índices que escribió la GPU
     VkDeviceSize gpu_index_offset = 0;
+    uint64_t index_bytes = uint64_t{isize} * d.count;
     if (indices) {
-        const uint64_t bytes = uint64_t{isize} * std::max(d.count, 1);
-        if (const Overlay* o = find_overlay(d.index_address, bytes, &gpu_index_offset)) {
-            gpu_index = o->buffer;
-        } else if (!gpu_args && !gather_overlays(d.index_address, bytes, &gpu_index, &gpu_index_offset)) {
-            skip_draw(11);
-            return;
+        if (gpu_args) {
+            // firstIndex and indexCount are evaluated by the GPU. Resolve ownership over
+            // the entire binding window, including writes that start after the first index.
+            if (window.size) {
+                const uint64_t available = window.size - (d.index_address - window.address);
+                index_bytes = available - available % isize;
+            }
+        }
+        if (index_bytes) {
+            if (const Overlay* o = find_overlay(d.index_address, index_bytes, &gpu_index_offset)) {
+                gpu_index = o->buffer;
+            } else if (!gather_overlays(d.index_address, index_bytes, &gpu_index, &gpu_index_offset)) {
+                skip_draw(11);
+                return;
+            }
         }
     }
     if ((gpu_index || gpu_args) && (d.primitive == 7 || d.index_type == 0)) {
@@ -8085,39 +8122,33 @@ void Executor::draw(const cmd::Draw& in) {
         return;
     }
     if (indices && !gpu_index) note_read(1, d.index_address, uint64_t{isize} * d.count);
-    // Multi-draw con los índices en la memoria del juego: de su ventana en espejo (revisada antes del pase).
+    // A guest-memory mirror is valid only after checking the readable window for GPU writes.
     VkBuffer mirror_index = VK_NULL_HANDLE;
     VkDeviceSize mirror_index_offset = 0;
-    if (multi && indices && !gpu_index && d.index_type >= 1) {
-        uint64_t base = 0, size = 0;
-        VkDeviceSize off = 0;
-        if (index_window(d.index_address, &base, &size))
-            if (const Mirror* m = mirror(base, size, &off, false)) {
+    if (gpu_args && !gpu_index) {
+        // Once the exact range proved guest-owned, adjacent multi-draws can still share a mirror.
+        auto backing = window;
+        uint64_t start = 0, pool_size = 0;
+        if (multi && !exact_args.empty() && pool_range(d.index_address, &start, &pool_size)) {
+            const uint64_t base = std::max(start, d.index_address & ~(kIndexWindowAlign - 1));
+            const uint64_t bytes = std::min(kIndexWindow, pool_size - (base - start));
+            if (index_bytes <= bytes - (d.index_address - base)) backing = {base, bytes};
+        }
+        if (backing.size >= kMirrorMin) {
+            if (const Mirror* m = mirror(backing.address, backing.size, &mirror_index_offset)) {
                 mirror_index = m->buffer;
-                mirror_index_offset = off + (d.index_address - base);
+                mirror_index_offset += d.index_address - backing.address;
             }
-    }
-    // Cuántos índices leer: los del draw; con el número en la GPU y los índices en la CPU (p. ej. quads de
-    // balas o partículas, que la GPU cuenta) no se sabe: un rango generoso, hasta el final del memory pool.
-    size_t index_bytes = size_t{isize} * d.count;
-    if (gpu_args && indices && !gpu_index && !mirror_index) {
-        size_t avail = 0;
-        uint64_t pool_start = 0, pool_size = 0;
-        if (pool_range(d.index_address, &pool_start, &pool_size)) avail = pool_start + pool_size - d.index_address;
-        // Multi-draw: todas las mallas suelen compartir un buffer de índices (hasta lo que cabe en el staging).
-        index_bytes = std::min<size_t>(avail, multi ? kStagingChunk : size_t{1} << 20) / isize * isize;
-        if (frame_ == trace_frame_)
-            NVN_LOG("F indirecto en la GPU con índices de la CPU: %zu bytes desde %#llx\n", index_bytes,
-                    static_cast<unsigned long long>(d.index_address));
+        }
     }
     const BufferCache::Entry* cached_indices =
-        indices && !gpu_index && d.primitive != 7 && index_bytes
+        indices && !gpu_index && !mirror_index && d.primitive != 7 && index_bytes
             ? buffer_cache_.get(d.index_address, index_bytes, d.index_type, submit_index_)
             : nullptr;
     VkBuffer host_index = VK_NULL_HANDLE;  // ese rango, si cambia demasiado para la caché: copia directa
     VkDeviceSize host_index_offset = 0;
     if (gpu_args && indices && !gpu_index && !cached_indices && index_bytes && !mirror_index) {
-        Staging::Alloc al = staging_->alloc(index_bytes, 16);
+        Staging::Alloc al = alloc_read_snapshot(d.index_address, index_bytes);
         if (!al.data) return;
         memcpy(al.data, indices, index_bytes);
         host_index = al.buffer;
@@ -9053,9 +9084,11 @@ Executor::BufferCopySource Executor::copy_from_overlay(uint64_t src, uint64_t ds
     barrier();
     // Lo de dst ya no está en la memoria del juego: para uniones y compactaciones es de la GPU (sin `written`: la
     // devolución sigue como antes).
-    if (auto it = overlays_.upper_bound(dst);
-        keep_gpu_overlays_ && it != overlays_.begin() && dst < std::prev(it)->first + std::prev(it)->second.size)
-        std::prev(it)->second.writers |= kWrittenByCopy;
+    if (auto it = overlays_.upper_bound(dst); it != overlays_.begin() && dst < std::prev(it)->first + std::prev(it)->second.size) {
+        auto& target = std::prev(it)->second;
+        target.device_update = submitted_.load(std::memory_order_relaxed) + 1;
+        if (keep_gpu_overlays_) target.writers |= kWrittenByCopy;
+    }
     // A copy for the CPU to read (readback_copies_): returned to the game's memory once this submit finishes.
     if (readback_copies_ && !write_back_on_)
         if (auto it = overlays_.upper_bound(dst); it != overlays_.begin()) {
@@ -9328,12 +9361,98 @@ bool Executor::pool_range(uint64_t address, uint64_t* start, uint64_t* size) {
     return true;
 }
 
-bool Executor::index_window(uint64_t address, uint64_t* base, uint64_t* size) {
+BufferRange Executor::indirect_index_window(uint64_t address, bool multi) {
     uint64_t start = 0, pool_size = 0;
-    if (!pool_range(address, &start, &pool_size)) return false;
-    *base = std::max<uint64_t>(start, address & ~(kIndexWindowAlign - 1));
-    *size = std::min<uint64_t>(start + pool_size - *base, kIndexWindow);
-    return *size >= kMirrorMin;
+    if (!pool_range(address, &start, &pool_size)) return {};
+    const uint64_t base = multi ? std::max(start, address & ~(kIndexWindowAlign - 1)) : address;
+    const uint64_t size = pool_size - (base - start);
+    if (size > kIndexWindow) return {};
+    const uint64_t remaining = size - (address - base);
+    if (remaining >= kMirrorMin) {
+        // Avoid a megabyte-sized snapshot per draw for a small GPU patch. Resolve the
+        // actual firstIndex/count instead. Clean windows can keep their shared mirror.
+        const auto it = first_overlay_touching(address);
+        if (it != overlays_.end() && it->first < base + size &&
+            (it->first > address || it->second.size - (address - it->first) < remaining)) return {};
+    }
+    return {base, size};
+}
+
+bool Executor::materialize_index_parameters(cmd::Draw& draw, size_t bytes, std::vector<uint32_t>& args,
+                                            uint32_t& count, BufferRange& indices) {
+    bool needs_wait = false;
+    auto source = [&](uint64_t address, size_t size, const uint8_t*& host) {
+        VkBuffer buffer{};
+        VkDeviceSize offset = 0;
+        if (const Overlay* overlay = find_overlay(address, size, &offset)) {
+            host = overlay->data + (offset - overlay->offset);
+            needs_wait |= overlay->device_update > index_params_visible_;
+        } else {
+            if (!gather_overlays(address, size, &buffer, &offset, &host)) return false;
+            if (buffer) needs_wait = true;  // gathering fragments recorded a new copy
+            else host = reinterpret_cast<const uint8_t*>(address);
+        }
+        return true;
+    };
+    const uint8_t *records = nullptr, *draws = nullptr;
+    if (!source(draw.indirect, bytes, records) || (draw.draw_count && !source(draw.draw_count, 4, draws))) return false;
+    bool ok = true;
+    if (needs_wait) {
+        barrier();
+        VkMemoryBarrier visibility{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        visibility.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        visibility.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &visibility, 0, nullptr, 0, nullptr);
+        const auto previous = submitted_.load();
+        const auto fence = inflight_[cur_].fence;
+        splitting_ = true;
+        finish();
+        ok = submitted_.load() != previous && vkWaitForFences(vk()->device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        if (ok) index_params_visible_ = submitted_.load();
+        splitting_ = false;
+    }
+    if (ok) {
+        std::lock_guard lock(wb_mutex_);
+        if (draws) memcpy(&count, draws, sizeof(count));
+        count = draw.draw_count ? std::min(count, uint32_t(draw.max_draws)) : 1;
+        if (count) {
+            const size_t active = draw.draw_count ? size_t(count - 1) * draw.stride + 20 : bytes;
+            args.resize(active / sizeof(uint32_t));
+            memcpy(args.data(), records, active);
+        }
+    }
+    if (needs_wait) begin();
+    if (!ok) return false;
+
+    const size_t stride = draw.draw_count ? size_t(draw.stride) / 4 : 5;
+    uint32_t first = UINT32_MAX;
+    uint64_t end = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto* record = args.data() + i * stride;
+        if (records == reinterpret_cast<const uint8_t*>(draw.indirect) && absurd_draw(record[0], record[1])) {
+            NVN_LOG("ignoring invalid CPU indirect arguments: %u indices, %u instances\n", record[0], record[1]);
+            record[0] = 0;
+        }
+        if (!record[0] || !record[1]) continue;
+        first = std::min(first, record[2]);
+        end = std::max(end, uint64_t{record[2]} + record[0]);
+    }
+    if (!end) return true;
+    const uint64_t width = index_size(draw.index_type);
+    uint64_t base = 0, size = 0;
+    if (end * width > UINT64_MAX - draw.index_address ||
+        (pool_range(draw.index_address, &base, &size) && end * width > size - (draw.index_address - base))) {
+        NVN_LOG("indirect index read outside memory pool: %#llx + %llu bytes\n",
+                (unsigned long long)draw.index_address, (unsigned long long)(end * width));
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        auto* record = args.data() + i * stride;
+        if (record[0] && record[1]) record[2] -= first;
+    }
+    draw.index_address += uint64_t{first} * width;
+    indices = {draw.index_address, (end - first) * width};
+    return true;
 }
 
 void Executor::destroy_mirror(Mirror& m) {
@@ -9678,6 +9797,7 @@ const Executor::Overlay* Executor::merge_overlays(uint64_t address, uint64_t siz
         po.checked = submit_index_;
         po.writers = pc.writers;
         po.written = pc.written;
+        po.device_update = submitted_.load(std::memory_order_relaxed) + 1;
         wb_lock.unlock();
         filter_overlay(pc.start, pc.size, +1);
         piece_copies.push_back({pc.from, po.buffer, pc.from_offset, po.offset, pc.size});
@@ -9707,6 +9827,7 @@ const Executor::Overlay* Executor::merge_overlays(uint64_t address, uint64_t siz
         o.writers = writers;  // sigue siendo de la GPU (otra unión, compactación)
         o.written = written;
         o.merged = true;
+        o.device_update = submitted_.load(std::memory_order_relaxed) + 1;
         made = &o;
     }
     filter_overlay(address, size, +1);
@@ -10292,6 +10413,7 @@ std::map<uint64_t, Executor::Overlay>::iterator Executor::overlay_containing(uin
 
 void Executor::patch_overlay(std::map<uint64_t, Overlay>::iterator it, uint64_t address, uint64_t size) {
     Overlay& o = it->second;
+    o.device_update = submitted_.load(std::memory_order_relaxed) + 1;
     const uint64_t start = it->first;
     split_why_ = "parche de overlay (escritura de la CPU)";
     end_render_pass();  // las copias no van dentro de un pase
