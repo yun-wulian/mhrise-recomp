@@ -61,6 +61,15 @@ the A725.
 
 To read a PGM or PPM, any image viewer works, or `PIL.Image.open()` in Python. Depth is reversed Z, so near is bright.
 
+**NPC face NaNs (pixel shader `c87ca93efba78188`).** A full frame capture instruments matching HDR draws for that
+frame only. Each `face-f<frame>-d<draw>.raw` is the scene colour immediately after that draw; the matching `.spv`
+is the original fragment module. A fragment with a nonfinite RGB export encodes its first observed nonfinite input,
+sample, division or selected math result. Result 0 means none of those checkpoints saw it. A checkpoint can belong
+to a calculation whose value was later discarded. Inspect a known affected face pixel before interpreting the frame
+histogram (other draws also occupy this target). Run `python tools/read_face_probe.py <raw> --pixel X Y` in
+render-target coordinates, then `spirv-dis --raw-id <spv>` to look up the result ID. The log records matched draws
+and successful readbacks. The captured image can show bright diagnostic pixels for that frame.
+
 ## GPU breadcrumbs
 
 `breadcrumbs` (Debug menu). Every pass and dispatch writes a marker, and the GPU runs everything in order. When the GPU

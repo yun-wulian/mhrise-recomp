@@ -49,6 +49,7 @@ add_library(nnsdk SHARED
   src/nnsdk/nvn/count_check.cpp
   src/nnsdk/nvn/formats.cpp
   src/nnsdk/nvn/executor.cpp
+  src/nnsdk/nvn/face_nan_probe.cpp
   src/nnsdk/nvn/pipeline_compiler.cpp
   src/nnsdk/nvn/driver_pipeline_cache.cpp
   src/nnsdk/nvn/gpu_memory.cpp

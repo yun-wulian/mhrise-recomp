@@ -49,6 +49,7 @@
 #include "nnsdk/nvn/pipeline_compiler.h"
 #include "nnsdk/nvn/queue_state.h"
 #include "nnsdk/nvn/count_check.h"
+#include "nnsdk/nvn/face_nan_probe.h"
 #include "nnsdk/watch.h"
 #include "nnsdk/nvn/present_image.h"
 #include "nnsdk/nvn/texture_region.h"
@@ -1234,7 +1235,9 @@ private:
     bool fast_bindless_ = true;    // interruptor no_fast_bindless (read_flags)
     // El de layout() a partir de lo traducido de cada etapa y su identidad (el precalentado no tiene ProgramStage).
     Layout& layout_for(const nvnshader::Translated* const* shaders, const uint64_t* ids);
-    VkPipeline pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, uint32_t color_count, VkSampleCountFlagBits samples);
+    VkPipeline pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, uint32_t color_count, VkSampleCountFlagBits samples,
+                        bool probe_face = false);
+    VkPipeline face_pipeline(const PipelineKey& key, uint64_t inputs, Layout& layout, VkRenderPass pass);
     bool resolve_texture(Stage s, const Resource& r, Texture*& tex, TextureViewDesc& v, Sampler*& smp);
     bool resolve_bindless(Stage s, const Resource& r, Texture*& tex, TextureViewDesc& v, Sampler*& smp);
     bool resolve_image(Stage s, const ProgramStage& ps, const Resource& r, Texture*& tex, TextureViewDesc& v);
@@ -1771,6 +1774,8 @@ private:
     std::unordered_map<BytesKey<ViewKeyData>, VkImageView, BytesKeyHash<ViewKeyData>> views_;
     std::unordered_map<BytesKey<LayoutKeyData>, Layout, BytesKeyHash<LayoutKeyData>> layouts_;
     std::unordered_map<uint64_t, VkPipeline> pipelines_;
+    std::unordered_map<uint64_t, VkPipeline> face_probe_pipelines_;
+    unsigned face_probe_matches_ = 0, face_probe_saved_ = 0;
     struct DefaultImages { Texture one_d, two_d, three_d, cube; };
     DefaultImages sampled_defaults_, storage_defaults_;
     std::vector<uint64_t> bindless_key_;  // la clave del draw en curso (sin reservas por draw)
@@ -6903,8 +6908,52 @@ static void apply_fragment_exports(PipelineKey& key, const nvnshader::Translated
     key.color.blend_enable &= exports;
 }
 
+VkPipeline Executor::face_pipeline(const PipelineKey& key, uint64_t inputs, Layout& layout, VkRenderPass pass) {
+    // The captured face draw has vertex and fragment stages only. Keep its fetch specialization.
+    constexpr int vertex = static_cast<int>(Stage::Vertex), fragment = static_cast<int>(Stage::Fragment);
+    for (int i = 0; i < kStages; ++i)
+        if (i != vertex && i != fragment && i != static_cast<int>(Stage::Compute) && st_.stages[i] &&
+            !(i == static_cast<int>(Stage::Geometry) && key.skip_gs)) return VK_NULL_HANDLE;
+    const auto* vs = st_.stages[vertex];
+    const auto* fs = st_.stages[fragment];
+    if (!vs) return VK_NULL_HANDLE;
+    nvnshader::Translated variant;
+    const auto* translated = &fs->shader;
+    if (fs->shader.input_generics & ~vs->shader.output_generics) {
+        const auto v = geometry_variant(*const_cast<ProgramStage*>(fs), vs->shader.output_generics, 0);
+        if (!v.module || !cached_translation(v.cache_key, variant)) return VK_NULL_HANDLE;
+        translated = &variant;
+    }
+    const std::string dir = "/storage/emulated/0/NieR-volcados";
+    mkdir(dir.c_str(), 0775);
+    const std::string name = dir + "/face-f" + std::to_string(frame_) + "-d" + std::to_string(traced_draws_);
+    const auto& source = translated->spirv;
+    std::ofstream original(name + ".spv", std::ios::binary);
+    original.write(reinterpret_cast<const char*>(source.data()), source.size() * sizeof(uint32_t));
+    original.close();
+    if (!original) return VK_NULL_HANDLE;
+    const uint64_t h = hash_bytes(&key, sizeof key);
+    if (auto it = face_probe_pipelines_.find(h); it != face_probe_pipelines_.end()) return it->second;
+    VkShaderModule modules[kStages]{};
+    const auto fetch = vertex_input_types(key, inputs);
+    modules[vertex] = fetch ? vertex_variant(*const_cast<ProgramStage*>(vs), fetch).module : vs->module;
+    if (!modules[vertex]) return VK_NULL_HANDLE;
+    const auto patched = instrument_face_nan(source);
+    if (patched.empty() || create_shader_module(vk()->device, patched, &modules[fragment]) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    VkPipeline diagnostic = VK_NULL_HANDLE;
+    const auto status = make_graphics_pipeline(key, modules, inputs, layout.pipeline, pass, VK_NULL_HANDLE, diagnostic);
+    vkDestroyShaderModule(vk()->device, modules[fragment], nullptr);
+    if (status != VK_SUCCESS) {
+        NVN_LOG("face probe: graphics pipeline %s\n", vk_result_name(status));
+        return VK_NULL_HANDLE;
+    }
+    face_probe_pipelines_.emplace(h, diagnostic);
+    return diagnostic;
+}
+
 VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, uint32_t color_count,
-                              VkSampleCountFlagBits samples) {
+                              VkSampleCountFlagBits samples, bool probe_face) {
     if (prof_timing_) fine_.pipe_lookups++;
     const VkContext& context = *vk();
     PipelineKey key;
@@ -6970,6 +7019,7 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
         normalize_vertex_input(key);  // (set per draw: see the dynamic state)
     }
     // La misma clave que la última encontrada: su hash y su pipeline, sin volver a hashear ni buscar.
+    if (probe_face) return face_pipeline(key, inputs, l, rp);
     const bool memo = memo_pipeline_ && !per_stage_keys_ && last_pipeline_ && memcmp(&key, &last_pipeline_key_, sizeof key) == 0;
     uint64_t h = memo ? last_pipeline_hash_ : hash_bytes(&key, sizeof key);
     if (prof_count_stage_keys_ || per_stage_keys_) {  // la clave de antes (por etapa) de este draw
@@ -8149,7 +8199,18 @@ void Executor::draw(const cmd::Draw& in) {
             st_.depth_stencil.depth_func = kDepthGequal;
         }
     }
-    VkPipeline p = pipeline(d, rp_, l, rp_color_count_, rp_samples_);
+    VkPipeline p = VK_NULL_HANDLE;
+    if (frame_ == trace_frame_ && full_trace_) {
+        const auto* fs = st_.stages[static_cast<int>(Stage::Fragment)];
+        if (fs && fs->print == kFacePixelShader && st_.rt.count && st_.rt.colors[0] &&
+            st_.rt.colors[0]->vk_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+            ++face_probe_matches_;
+            p = pipeline(d, rp_, l, rp_color_count_, rp_samples_, true);
+            if (!p) NVN_LOG("face probe: unavailable for draw %d; using original pipeline\n", traced_draws_);
+        }
+    }
+    const bool face_probed = p != VK_NULL_HANDLE;
+    if (!p) p = pipeline(d, rp_, l, rp_color_count_, rp_samples_);
     st_.color.blend_enable = saved_blend;
     st_.depth_stencil = saved_depth;
     if (!p) {
@@ -8654,6 +8715,15 @@ void Executor::draw(const cmd::Draw& in) {
     if (writes_storage) storage_since_barrier_ = true;
     note_pass_writes();
     publish_storage_writes(textures, "imagen de un draw");
+    if (face_probed) {
+        end_render_pass();
+        targets_changed_ = true;
+        const auto name = "face-f" + std::to_string(frame_) + "-d" + std::to_string(traced_draws_);
+        const bool saved = dump_raw(*st_.rt.colors[0], name);
+        face_probe_saved_ += saved;
+        NVN_LOG("face probe: %s raw %s\n", name.c_str(), saved ? "saved" : "failed");
+        begin();
+    }
     if (loading_armed_ && (loading_log_ || !loading_matches_.empty())) {
         record_loading_draw(d, p, attachments);
         if (loading_log_)
@@ -11858,6 +11928,9 @@ void Executor::dump_frame(Texture* presented) {
     }
     if (frame_ == trace_frame_) {
         std::string counts;
+        if (full_trace_) NVN_LOG("face probe: frame %llu, matched %u, saved %u\n",
+            static_cast<unsigned long long>(frame_), face_probe_matches_, face_probe_saved_);
+        face_probe_matches_ = face_probe_saved_ = 0;
         for (size_t k = 0; k < std::size(trace_counts_); k++)
             if (trace_counts_[k]) counts += " " + std::to_string(k) + ":" + std::to_string(trace_counts_[k]);
         NVN_LOG("F comandos del frame (índice del variant:cuenta):%s; draws con render desactivado %llu\n", counts.c_str(),
