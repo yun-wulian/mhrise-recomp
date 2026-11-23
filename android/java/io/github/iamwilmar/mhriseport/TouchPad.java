@@ -7,8 +7,10 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.RenderNode;
+import android.hardware.input.InputManager;
 import android.os.SystemClock;
 import android.view.Choreographer;
+import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 
@@ -22,7 +24,7 @@ import io.github.iamwilmar.mhriseport.Controls.Ctl;
 // En modo edición cada control se arrastra a su sitio; la barra de arriba cambia el tamaño del elegido, lo esconde o lo
 // enseña, y lo devuelve todo a su sitio.
 @SuppressLint("ViewConstructor")
-final class TouchPad extends View {
+final class TouchPad extends View implements InputManager.InputDeviceListener {
     interface Host {
         void send(long buttons, int sticksOn, float lx, float ly, float rx, float ry);
         void touchPoint(int action, float x, float y, long timeNs, int width, int height);
@@ -54,6 +56,8 @@ final class TouchPad extends View {
 
     private final Controls cfg;
     private final Host host;
+    private final InputManager inputManager;
+    private boolean controllerConnected;
     private static final Ctl[] CONTROLS = Ctl.values();
     private final boolean animateControls;
     private final Appearance[] artwork = new Appearance[CONTROLS.length];
@@ -208,6 +212,7 @@ final class TouchPad extends View {
         super(context);
         this.cfg = cfg;
         this.host = host;
+        inputManager = context.getSystemService(InputManager.class);
         this.animateControls = animateControls;
         for (int k = 0; k < artwork.length; ++k) artwork[k] = new Appearance();
         for (int i = 0; i < MAX_FINGERS; i++) fingers[i] = new Finger();
@@ -238,7 +243,7 @@ final class TouchPad extends View {
 
     private boolean active(Ctl c) {
         if (c == Ctl.MENU) return true;  // (siempre: es la forma de volver a encender los demás)
-        if (!cfg.touchOn) return false;
+        if (!cfg.touchOn || (controllerConnected && !editing)) return false;
         if (c == Ctl.MOD && !modsAvailable) return false;
         if (c.combo() && cfg.combo[c.comboIndex()] == 0) return false;
         return cfg.shown[c.ordinal()] || editing;
@@ -584,7 +589,7 @@ final class TouchPad extends View {
             lastSticks = on;
         }
         if (editing) invalidate();
-        else if (moving && animateControls) {
+        else if (moving && animateControls && cfg.touchOn && !controllerConnected) {
             if (!animationFramePending) {
                 animationFramePending = true;
                 Choreographer.getInstance().postFrameCallback(animationFrame);
@@ -652,10 +657,56 @@ final class TouchPad extends View {
         dirtyGlyphs = -1L;
     }
 
-    @Override protected void onDetachedFromWindow() {
+    private void cancelControlAnimation() {
         Choreographer.getInstance().removeFrameCallback(animationFrame);
         animationFramePending = false;
         nextAnimationFrame = 0;
+    }
+
+    @Override protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        inputManager.registerInputDeviceListener(this, getHandler());
+        refreshControllers();
+    }
+
+    @Override public void onInputDeviceAdded(int id) { refreshControllers(); }
+    @Override public void onInputDeviceChanged(int id) { refreshControllers(); }
+    @Override public void onInputDeviceRemoved(int id) { refreshControllers(); }
+
+    private boolean hasPhysicalController() {
+        for (int id : inputManager.getInputDeviceIds()) {
+            InputDevice device = inputManager.getInputDevice(id);
+            if (device != null && !device.isVirtual() && device.isEnabled() &&
+                    (device.supportsSource(InputDevice.SOURCE_GAMEPAD) || device.supportsSource(InputDevice.SOURCE_JOYSTICK)))
+                return true;
+        }
+        return false;
+    }
+
+    private void refreshControllers() {
+        boolean connected = hasPhysicalController();
+        if (controllerConnected == connected) return;
+        controllerConnected = connected;
+        if (editing) return;
+        if (connected) {
+            cancelControlAnimation();
+            // Release only controls that disappear. HUD, gear and camera gestures keep their fingers.
+            for (Finger f : fingers) {
+                if (f.ctl == null || f.ctl == Ctl.MENU) continue;
+                release(f, false);
+                f.id = -1;
+                f.ctl = null;
+            }
+            java.util.Arrays.fill(latched, false);
+            pulse = 0;
+            update();
+        }
+        invalidate();
+    }
+
+    @Override protected void onDetachedFromWindow() {
+        inputManager.unregisterInputDeviceListener(this);
+        cancelControlAnimation();
         for (Appearance a : artwork) if (a.node != null) a.node.discardDisplayList();
         dirtyGlyphs = -1L;
         super.onDetachedFromWindow();
