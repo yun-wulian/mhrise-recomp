@@ -337,6 +337,7 @@ std::recursive_mutex& executor_mutex();
 bool publish_virtual_pool(void* pool, Texture* only = nullptr);
 bool publish_virtual_buffers(void* pool);
 void queue_cpu_fence(void* sync);
+bool before_guest_texture_access(const void* data, size_t size);
 // Perfil de cargas: lo que un hilo del juego esperó a executor_mutex() (el ejecutor lo tiene durante todo un envío).
 void note_executor_lock_wait(uint64_t ns);
 // Toma executor_mutex() con `lock` (sin tomar) y, si estaba ocupado, apunta la espera.

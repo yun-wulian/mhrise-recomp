@@ -25,6 +25,7 @@ void* nvnBufferMap(const void*);
 void nvnBufferFinalize(void*);
 int nvnTextureInitialize(void*, const nvn::TextureDesc*);
 void nvnTextureFinalize(void*);
+int nvnSyncWait(const void*, uint64_t);
 }
 
 static bool test_virtual_page_replacement(auto& executor, const auto& read_byte) {
@@ -215,7 +216,124 @@ static bool test_virtual_page_replacement(auto& executor, const auto& read_byte)
     if (!executor.run({&fenced}) || !executor.virtual_pending_.load() ||
         !nvnMemoryPoolMapVirtual(&virt, 1, &raw_page) || bytes[0] != 255 || bytes[tile-2] != 0) return false;
     if (!executor.run({&fenced}) || executor.virtual_pending_.load() || bytes[tile] != 255 || bytes[2*tile-2] != 0) return false;
-    if (!nvnMemoryPoolMapVirtual(&virt, 1, &native_page) || !executor.run({&fenced}) || !executor.virtual_pending_.load()) return false;
+    using Visibility = typename std::remove_reference_t<decltype(executor)>::Visibility;
+    const auto cpu_fence = [&] { return executor.publish_virtual_pool(nullptr, nullptr, Visibility::CpuFence); };
+    CommandList write;
+    write.commands = {red};
+    if (!executor.run({&write}) || !cpu_fence()) return false;
+    auto green = red;
+    green.color[0] = 0;
+    green.color[1] = 0x3f800000;
+    const auto stage = [&](const auto& clear) {
+        executor.begin();
+        executor.clear_texture(clear);
+        const auto producer = executor.last_submit();
+        executor.maybe_split();
+        if (executor.last_submit() != producer + 1) return false;
+        executor.finish(); // later queued work still belongs to the guest fence
+        return true;
+    };
+    if (!stage(green) || bytes[tile + 1] != 0) return false;
+    // The driver still executes the wait. Check which fence was selected even on GPUs
+    // that have already completed the following submit by the time the host gets here.
+    auto tail = executor.last_submit();
+    VkFence producer_fence{};
+    for (const auto& slot : executor.inflight_)
+        if (slot.submit == tail - 1) producer_fence = slot.fence;
+    static PFN_vkWaitForFences driver_wait;
+    static thread_local VkFence observed;
+    observed = VK_NULL_HANDLE;
+    driver_wait = vkWaitForFences;
+    vkWaitForFences = [](VkDevice device, uint32_t count, const VkFence* fences, VkBool32 all, uint64_t timeout) {
+        if (count == 1) observed = fences[0];
+        return driver_wait(device, count, fences, all, timeout);
+    };
+    const bool published = cpu_fence();
+    vkWaitForFences = driver_wait;
+    if (!published || !producer_fence || observed != producer_fence || executor.last_submit() != tail) return false;
+    for (size_t i = tile; i < 2 * tile; i += 4)
+        if (bytes[i] || bytes[i + 1] != 255 || bytes[i + 2] || bytes[i + 3] != 255) return false;
+    // A later write supersedes a recorded copy; recycling its slot also invalidates it.
+    if (!stage(green) || !executor.run({&write})) return false;
+    tail = executor.last_submit();
+    if (!cpu_fence() || executor.last_submit() <= tail || bytes[tile] != 255 || bytes[tile + 1]) return false;
+    if (!stage(green)) return false;
+    for (int k = 0; k < executor.kInFlight; ++k) { executor.begin(); executor.finish(); }
+    tail = executor.last_submit();
+    if (!cpu_fence() || executor.last_submit() <= tail || bytes[tile] || bytes[tile + 1] != 255) return false;
+    executor.begin();
+    executor.clear_texture(red);
+    auto& prefetch_staging = executor.inflight_[executor.cur_].texel_readback;
+    prefetch_staging.trim(0);
+    prefetch_staging.failed_ = true;
+    tail = executor.last_submit();
+    executor.maybe_split();
+    if (executor.last_submit() != tail) return false;
+    executor.finish();
+    if (!cpu_fence() || bytes[tile] != 255 || bytes[tile + 1]) return false;
+    // Delay host observation of the real fences. An independent job can record while
+    // guest polling still times out; releasing the gate still requires real GPU completion.
+    executor.wait_all();
+    executor.begin();
+    static std::atomic<bool> release;
+    static PFN_vkGetFenceStatus driver_status;
+    static std::mutex gate_mutex;
+    static std::condition_variable gate_cv;
+    release.store(false);
+    driver_status = vkGetFenceStatus;
+    vkGetFenceStatus = [](VkDevice device, VkFence fence) { return release.load() ? driver_status(device, fence) : VK_NOT_READY; };
+    vkWaitForFences = [](VkDevice device, uint32_t count, const VkFence* fences, VkBool32 all, uint64_t timeout) {
+        std::unique_lock lock(gate_mutex);
+        if (!gate_cv.wait_for(lock, std::chrono::nanoseconds(std::min<uint64_t>(timeout, 1ull << 62)), [] { return release.load(); }))
+            return VK_TIMEOUT;
+        return driver_wait(device, count, fences, all, timeout);
+    };
+    bool expired = false;
+    std::thread signal([&] {
+        std::unique_lock lock(gate_mutex);
+        expired = !gate_cv.wait_for(lock, std::chrono::seconds(2), [] { return release.load(); });
+        release.store(true);
+        gate_cv.notify_all();
+    });
+    int sync_handle;
+    uint32_t unrelated = 0, copied_pixel = 0;
+    CommandList independent, raw_read;
+    independent.commands = {cmd::ReportValue{135, reinterpret_cast<uintptr_t>(&unrelated)}};
+    raw_read.commands = {cmd::CopyBuffer{heap + tile, reinterpret_cast<uintptr_t>(&copied_pixel), 4}};
+    bool queued = stage(green);
+    const auto ticket = g_submit_queue.submit({}, &sync_handle);
+    g_submit_queue.drain();
+    queued = queued && executor.deferred_submit_.load() && !wait_submit(ticket, 0) &&
+             executor.run({&independent}) && unrelated == 135 && bytes[tile] == 255;
+    {
+        std::lock_guard lock(gate_mutex);
+        release = true;
+    }
+    gate_cv.notify_all();
+    signal.join();
+    const bool ordered = executor.run({&raw_read}) && copied_pixel == 0xff00ff00 &&
+                         wait_submit(ticket, UINT64_MAX) && !executor.deferred_submit_.load();
+    executor.wait_all();
+    vkGetFenceStatus = driver_status;
+    vkWaitForFences = driver_wait;
+    printf("queued texture fence: independent submit %d, physical alias and guest wait %d, watchdog %d\n", queued, ordered, expired);
+    if (!queued || !ordered || expired) return false;
+    // A driver error on a client poll must fail this receipt and leave the source
+    // available. A remap can retry it and publish into the original physical page.
+    executor.wait_all();
+    vkGetFenceStatus = [](VkDevice, VkFence) { return VK_NOT_READY; };
+    bool armed = executor.retire_fence_copy(true) && stage(red);
+    const auto failed_ticket = g_submit_queue.submit({}, &sync_handle);
+    g_submit_queue.drain();
+    armed = armed && executor.deferred_submit_.load() && !wait_submit(failed_ticket, 0);
+    vkGetFenceStatus = [](VkDevice, VkFence) { return VK_ERROR_OUT_OF_HOST_MEMORY; };
+    const bool failed = nvnSyncWait(&sync_handle, 0) == 3 && bytes[tile + 1] == 255;
+    vkGetFenceStatus = driver_status;
+    if (!armed || !failed || !nvnMemoryPoolMapVirtual(&virt, 1, &raw_page) ||
+        bytes[tile] != 255 || bytes[tile + 1] || nvnSyncWait(&sync_handle, 0) != 3) return false;
+    // Remapping before a CPU fence still publishes into the old physical page.
+    if (!stage(green) || !nvnMemoryPoolMapVirtual(&virt, 1, &native_page) ||
+        bytes[tile] || bytes[tile + 1] != 255 || !executor.run({&fenced}) || !executor.virtual_pending_.load()) return false;
     int raw_buffer;
     TestBufferBuilder raw_view{nullptr, &virt, 0, tile};
     if (!nvnBufferInitialize(&raw_buffer, &raw_view) || executor.virtual_pending_.load()) return false;

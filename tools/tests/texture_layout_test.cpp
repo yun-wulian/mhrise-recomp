@@ -2,6 +2,21 @@
 #include <cassert>
 #include <utility>
 
+static void check_swizzle_rows(const nvn::LevelLayout& level, const nvn::BlockBox& box) {
+    constexpr uint32_t bytes = 4;
+    const size_t pitch = size_t{box.width} * bytes + 13;
+    const size_t slice = pitch * box.height + 7;
+    std::vector<uint8_t> input(slice * box.depth);
+    for (size_t i = 0; i < input.size(); ++i) input[i] = uint8_t(i * 37 + i / 251);
+    std::vector<uint8_t> actual(level.size, 0xa5), expected = actual;
+    nvn::swizzle_region(level, bytes, box, input.data(), pitch, slice, actual.data());
+    for (uint32_t y = 0; y < box.height; ++y) {
+        const nvn::BlockBox row{box.x, box.y + y, box.z, box.width, 1, box.depth};
+        nvn::swizzle_region(level, bytes, row, input.data() + y * pitch, pitch, slice, expected.data());
+    }
+    assert(actual == expected); // includes untouched rows, columns, slices and tile padding
+}
+
 int main() {
     using nvn::compute_layout;
     // Both 8- and 16-GOB layouts occupy 256 KiB for Rise's 512x77 RGBA8 animation maps.
@@ -32,4 +47,10 @@ int main() {
     assert(packaged.levels[0].block_height_gobs == 16);
     const auto volume = compute_layout(32, 77, 1, 1, 1, 4, 1, 1, false, 0, true);
     assert(volume.levels[0].block_height_gobs == 16);
+    const auto preview = compute_layout(1136, 922, 1, 1, 1, 4, 1, 1, false, 0, false);
+    check_swizzle_rows(preview.levels[0], {0, 0, 0, 1136, 922, 1});
+    const auto partial = compute_layout(64, 40, 4, 1, 1, 4, 1, 1, false, 0, true);
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t height = 1; height <= 25; ++height)
+            check_swizzle_rows(partial.levels[0], {16, y, 1, 32, height, 2});
 }

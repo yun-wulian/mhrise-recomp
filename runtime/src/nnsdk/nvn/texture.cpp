@@ -126,6 +126,7 @@ void write_texels(nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyR
                     region ? region->width : 0, region ? region->height : 0, region ? region->depth : 0);
         return;
     }
+    if (!nvn::before_guest_texture_access(t.storage, t.layout.total_size())) return;
     const auto* src = static_cast<const uint8_t*>(data);
     for (uint32_t k = 0; k < r.layers; k++) {
         uint8_t* level = level_storage(t, r, r.layer + k);
@@ -515,6 +516,7 @@ nvn::Boolean nvnTextureInitialize(void* texture, const TextureDesc* b) {
         NVN_LOG("textura de vídeo %p: %dx%d formato 0x%x flags 0x%x stride %d pool %p +0x%llx -> %p\n", texture, b->width,
                 b->height, b->format, b->flags, b->stride, b->pool, static_cast<unsigned long long>(b->offset),
                 static_cast<void*>(t.storage));
+    if (t.storage && !nvn::before_guest_texture_access(t.storage, t.layout.total_size())) return 0;
     if (nvn::g_textures.bind(texture, std::move(t)) && !nvn::publish_virtual_pool(b->pool)) {
         if (!lock.owns_lock()) nvn::lock_executor(lock);
         nvn::g_textures.unbind(texture);

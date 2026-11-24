@@ -155,7 +155,10 @@ nvn::Boolean nvnMemoryPoolInitialize(void* pool, const MemoryPoolBuilder* b) {
     return 1;
 }
 void nvnMemoryPoolFinalize(void* pool) {
-    if (auto* current = nvn::g_memory_pools.get(pool); current && current->reserved) {
+    auto* current = nvn::g_memory_pools.get(pool);
+    if (current && (current->flags & nvn::kPoolFlagPhysical) &&
+        !nvn::before_guest_texture_access(current->storage, current->size)) return;
+    if (current && current->reserved) {
         nvn::wait_idle();
         if (!nvn::publish_virtual_pool(pool)) return;
     }
@@ -177,6 +180,7 @@ nvn::Boolean nvnMemoryPoolMapVirtual(void* pool, int count, const MappingRequest
     bool ok = true;
     std::vector<std::pair<size_t, size_t>> changed;
     // A new virtual address can import a physical page last written through a different pool.
+    std::lock_guard executor(nvn::executor_mutex());
     if (count && !nvn::publish_virtual_pool(nullptr)) return 0;
     // Publish the new pages and their notifications together with respect to GPU-to-guest readback.
     std::unique_lock mapping(v->mapping_mutex);

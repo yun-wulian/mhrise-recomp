@@ -26,6 +26,9 @@ void before_kernel_write(void* p, size_t size);
 
 // ¿Se puede vigilar todo [address, address + size)? (heap o pools virtuales conocidos, y la vigilancia encendida)
 bool watchable(uintptr_t address, size_t size);
+// All CPU addresses of a fully backed virtual allocation. A missing or ambiguous
+// mapping makes the result unusable for excluding a pending memory dependency.
+bool alias_ranges(uintptr_t address, size_t size, std::vector<std::pair<uintptr_t, size_t>>& ranges);
 // Las páginas de 4 KB de [address, address + size) que cambiaron desde la última llamada con estas claves (keys: una
 // por página, del que llama; vacío la primera vez): quedan cerradas y se devuelven en tramos (offset, bytes) desde
 // address, para copiarlas justo después.

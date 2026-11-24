@@ -74,6 +74,7 @@ void unalias(int64_t h, uintptr_t address) {
 
 std::atomic<uint64_t> g_faults{0}, g_protects{0}, g_protect_ns{0};
 bool g_enabled = false;
+bool complete_alias_map = true;  // under g_lock
 bool g_handler = false;
 struct sigaction g_old_segv{};
 
@@ -208,9 +209,12 @@ void add_virtual_range(uintptr_t base, size_t size) {
     if (!g_enabled) return;
     Lock lock;
     const int n = g_virtual_count.load(std::memory_order_relaxed);
-    if (n >= kMaxVirtual) return;
+    if (n >= kMaxVirtual) { complete_alias_map = false; return; }
     auto* pages = table<std::atomic<uint32_t>>(size / kPage);
-    if (!pages) return;
+    if (!pages) { complete_alias_map = false; return; }
+    for (int i = 0; i < n; ++i)
+        if (base < g_virtual[i].base + g_virtual[i].size && g_virtual[i].base < base + size)
+            complete_alias_map = false;
     g_virtual[n] = {base, size, pages};
     g_virtual_count.store(n + 1, std::memory_order_release);
 }
@@ -238,6 +242,29 @@ void virtual_mapped(uintptr_t address, size_t size, uintptr_t heap) {
         protect_runs(close);
         return;
     }
+}
+
+bool alias_ranges(uintptr_t address, size_t size, std::vector<std::pair<uintptr_t, size_t>>& ranges) {
+    ranges.clear();
+    if (!g_enabled || !size || size > UINTPTR_MAX - address) return false;
+    std::vector<uintptr_t> pages;
+    {
+        Lock lock;
+        if (!complete_alias_map) return false;
+        for (uintptr_t a = address & ~(kPage - 1); a < address + size; a += kPage) {
+            bool virt = false;
+            const auto h = heap_page(a, &virt);
+            if (h < 0 || !virt) return false;
+            const auto it = g_aliases->find(h);
+            if (it == g_aliases->end()) return false;
+            pages.push_back(heap_address(h));
+            pages.insert(pages.end(), it->second.begin(), it->second.end());
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (auto p : pages) add_run(ranges, p);
+    return true;
 }
 
 void before_kernel_write(void* p, size_t size) {

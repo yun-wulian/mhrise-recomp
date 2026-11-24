@@ -1035,6 +1035,7 @@ public:
     // true si el envío ya terminó (o termina antes del plazo). Sin g_mutex: no espera a la reproducción en curso.
     bool wait_submit(uint64_t submit, uint64_t timeout_ns) {
         const bool done = wait_submit_fence(submit, timeout_ns);
+        if (deferred_failed_.load(std::memory_order_acquire)) return false;
         if (done) deliver_write_backs(submit);  // lo que lea la CPU del juego tras esta espera ya está en su memoria
         return done;
     }
@@ -1094,8 +1095,15 @@ public:
     }
     std::string describe_memory(uint64_t address, uint64_t size);
     bool sync_texture_storage(Texture& t, const Texture::TexelWrite& r);
-    enum class Visibility { Storage, CpuFence, Submission, Buffer };
-    bool publish_virtual_pool(void* pool, Texture* only = nullptr, Visibility visibility = Visibility::Storage);
+    enum class Visibility { Storage, CpuFence, Submission, Buffer, QueueFence };
+    bool publish_virtual_pool(void* pool, Texture* only = nullptr, Visibility visibility = Visibility::Storage,
+                              void* sync = nullptr, uint64_t ticket = 0);
+    bool before_guest_access(uint64_t address, uint64_t size);
+    bool guest_access_from_api(uint64_t address, uint64_t size) {
+        if (!deferred_submit_.load(std::memory_order_acquire) && !deferred_failed_.load(std::memory_order_acquire)) return true;
+        std::lock_guard lock(g_mutex);
+        return before_guest_access(address, size);
+    }
     void wait_idle() {
         std::lock_guard lock(g_mutex);
         publish_virtual_pool(nullptr);
@@ -1405,6 +1413,11 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         Staging staging{kSlotStagingChunk};
         Staging texel_readback{256 << 10, true};
+        struct {
+            uint64_t image{}, version{}, order{};
+            uint32_t mip{}, layer{};
+            uint8_t* data{};
+        } fence_copy;
         std::vector<VkDescriptorPool> pools;
         size_t pool = 0;
         bool pending = false;
@@ -1575,6 +1588,10 @@ private:
     // antes a la cola). completed_ lo adelanta también quien espera un envío desde otro hilo.
     std::atomic<uint64_t> submitted_{0}, completed_{0};
     void note_completed(uint64_t submit) {  // con fence_mutex_
+        if (const auto producer = deferred_submit_.load(std::memory_order_relaxed); producer && producer <= submit) {
+            deferred_copy_->publish();
+            deferred_submit_.store(0, std::memory_order_release);
+        }
         InFlight* done[kInFlight];
         int n = 0;
         for (InFlight& f : inflight_)
@@ -2098,6 +2115,29 @@ private:
     };
     bool prepare_texel_readback(Texture& t);
     bool readback_texels(std::vector<TexelReadback>& copies);
+    // A recurring host fence may ask for a level that was finished well before the rest of its frame.
+    // Stage a copy at a pass boundary. Guest memory is still published only at the original fence.
+    struct {
+        Texture* texture{};
+        uint32_t mip{}, layer{};
+        uint64_t requested{}, attempted = UINT64_MAX;
+        bool written{};
+    } fence_hint_;
+    bool stage_fence_copy();
+    bool publish_fence_copy(TexelReadback& copy, bool& used);
+    // The producer slot owns the immutable source. GPU completion delivers it before the
+    // slot can be reset or a client can observe a successful wait on this or a later fence.
+    std::optional<TexelReadback> deferred_copy_;
+    std::atomic<uint64_t> deferred_submit_{0};
+    void* deferred_sync_{};
+    uint64_t deferred_ticket_{};
+    std::atomic<bool> deferred_failed_{false}; // a failed slot was recycled; its dirty image must be read back again
+    void fail_deferred(uint64_t through);
+    std::vector<std::pair<uintptr_t, size_t>> deferred_ranges_;
+    bool defer_fence_copy(TexelReadback copy);
+    bool touches_deferred(uint64_t address, uint64_t size) const;
+    bool retire_fence_copy(bool wait);
+    bool prepare_command_access(const Command& command);
     std::map<void*, std::map<Texture*, DirtyLevels>> virtual_writes_;
     std::atomic<bool> virtual_pending_{false};
     bool cpu_publication_ok_ = true;
@@ -2128,6 +2168,7 @@ private:
                 }
         }
         ++t.content_version;
+        if (fence_hint_.texture == &t) fence_hint_.written = true;
         if (t.storage && !mirrors_.empty())
             note_gpu_write_vs_mirrors(reinterpret_cast<uintptr_t>(t.storage), t.layout.total_size(), what);
         t.gpu_write_frame = frame_;
@@ -2169,7 +2210,8 @@ private:
     // Multi-draw: no se sabe qué índices lee cada draw; su espejo es una ventana del memory pool que empieza en el
     // bloque de 8 MB de la dirección y sigue 24 MB (o hasta el final del pool): todos los de un bloque la comparten.
     static constexpr uint64_t kIndexWindowAlign = 8ull << 20, kIndexWindow = 24ull << 20;
-    BufferRange indirect_index_window(uint64_t address, bool multi);
+    BufferRange indirect_index_window(const cmd::Draw& draw, uint64_t args_size);
+    uint64_t mixed_index_bytes_ = 0;  // speculative snapshots charged to this guest submission
     uint64_t index_params_visible_ = 0;  // last submission synchronized for host reads of indirect arguments
     bool materialize_index_parameters(cmd::Draw& draw, size_t bytes, std::vector<uint32_t>& args,
                                       uint32_t& count, BufferRange& indices);
@@ -2696,7 +2738,8 @@ bool Executor::init() {
 void Executor::wait_slot(InFlight& f) {
     if (!f.pending) return;
     auto t0 = std::chrono::steady_clock::now();
-    if (vkWaitForFences(vk()->device, 1, &f.fence, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) crumb_report();
+    const auto result = vkWaitForFences(vk()->device, 1, &f.fence, VK_TRUE, UINT64_MAX);
+    if (result == VK_ERROR_DEVICE_LOST) crumb_report();
     // Con migas: el último envío ya acabó y aun así una empezó y no acabó. El driver abortó ese trabajo sin perder el
     // dispositivo (la Mali-G615 de un Dimensity 8300: cada envío 700 ms, el vigilante de la GPU matando un trabajo colgado,
     // y la pantalla en negro). Mismo informe que con la GPU perdida, una vez.
@@ -2706,6 +2749,7 @@ void Executor::wait_slot(InFlight& f) {
     prof_gpu_wait_us_ += waited_ns / 1000;
     g_drop_stats.wait_ns.fetch_add(static_cast<uint64_t>(waited_ns), std::memory_order_relaxed);
     std::lock_guard lock(fence_mutex_);
+    if (result != VK_SUCCESS) fail_deferred(f.submit);
     note_completed(f.submit);  // antes de dejar de estar en vuelo: quien no lo encuentre ya lo ve terminado
     f.pending = false;
 }
@@ -2724,8 +2768,10 @@ void Executor::begin() {
     const size_t used_chunks = f.staging.used_chunks();
     f.staging.reset();
     f.staging.trim(std::max<size_t>(used_chunks, 1), kStagingChunk);
+    const bool unused_fence_copy = f.fence_copy.data != nullptr;
+    f.fence_copy = {};
     f.texel_readback.reset();
-    f.texel_readback.trim(f.texel_readback.bytes() > kStagingChunk ? 0 : 1);
+    f.texel_readback.trim(unused_fence_copy || f.texel_readback.bytes() > kStagingChunk ? 0 : 1);
     // El tope de staging es por envío: los demás contextos guardaban su pico hasta reutilizarse (6 x 128 MB).
     // Los que la GPU ya terminó lo devuelven ahora (nadie en la CPU lee su staging tras un begin()).
     // Se miran también los demás envíos terminados, del más antiguo al más nuevo (acaban en orden): completed_
@@ -2833,6 +2879,7 @@ void Executor::finish(bool wait) {
     }
     recording_ = false;
     if (r != VK_SUCCESS) {
+        f.fence_copy = {};
         NVN_LOG("vkQueueSubmit: %s\n", vk_result_name(r));
         crumb_report();
     } else {
@@ -3289,6 +3336,7 @@ void Executor::write_stamps(InFlight& f) {
 
 void Executor::retire_texture(Texture& t) {
     std::lock_guard lock(g_mutex);
+    if (fence_hint_.texture == &t) fence_hint_ = {};
     ++texture_events_;
     if (auto it = feedback_copies_.find(&t); it != feedback_copies_.end()) {
         retire_texture(it->second.texture);
@@ -3495,9 +3543,14 @@ bool Executor::wait_submit_fence(uint64_t submit, uint64_t timeout_ns) {
                 for (InFlight& f : inflight_)
                     if (f.pending && f.submit == submit) slot = &f;
                 if (!slot) return true;  // ya no está en vuelo: terminó
-                if (vkGetFenceStatus(vk()->device, slot->fence) == VK_SUCCESS) {
+                const auto status = vkGetFenceStatus(vk()->device, slot->fence);
+                if (status == VK_SUCCESS) {
                     note_completed(submit);
                     return true;
+                }
+                if (status < 0) {
+                    if (const auto p = deferred_submit_.load(); p && p <= submit) sync_fail_at(deferred_sync_, deferred_ticket_);
+                    return false;
                 }
             }
             if (std::chrono::steady_clock::now() >= deadline) return false;
@@ -3521,6 +3574,10 @@ bool Executor::wait_submit_fence(uint64_t submit, uint64_t timeout_ns) {
     {
         std::lock_guard lock(fence_mutex_);
         if (r == VK_SUCCESS) note_completed(submit);
+        else if (r < 0) {
+            // The slot is still pinned. A later observer can retry this exact snapshot.
+            if (const auto p = deferred_submit_.load(); p && p <= submit) sync_fail_at(deferred_sync_, deferred_ticket_);
+        }
         if (--slot->waiters == 0) fence_cv_.notify_all();
     }
     return r == VK_SUCCESS;
@@ -3571,6 +3628,8 @@ bool Executor::record_overlay_readbacks() {
 bool Executor::run(const std::vector<const CommandList*>& lists) {
     std::lock_guard lock(g_mutex);
     if (!ready_ && !init()) return false;
+    if (deferred_failed_.load(std::memory_order_acquire) && !publish_virtual_pool(nullptr)) return false;
+    if (frame_ == trace_frame_ && !retire_fence_copy(true)) return false;
     cpu_publication_ok_ = true;
     auto t0 = std::chrono::steady_clock::now();
     // Perfil de cargas: lo de este envío (lo de fuera de run, p. ej. presentar, también cae aquí).
@@ -3586,6 +3645,7 @@ bool Executor::run(const std::vector<const CommandList*>& lists) {
     rusage ru0{};
     getrusage(RUSAGE_THREAD, &ru0);
     submit_index_++;
+    mixed_index_bytes_ = 0;
     // Interruptores, una vez por envío del juego. no_generations cambia la caché en el siguiente punto seguro
     // (entre draws o al terminar un envío de Vulkan).
     split_ = !NVN_FLAG("single_submit");
@@ -3723,7 +3783,37 @@ void Executor::read_flags() {
 
 // --- Estado ---
 
+bool Executor::prepare_command_access(const Command& c) {
+    const bool hit = std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, cmd::BindUniformBuffers> || std::is_same_v<T, cmd::BindVertexBuffers>) {
+            for (const auto& r : v.ranges) if (touches_deferred(r.address, r.size)) return true;
+        } else if constexpr (std::is_same_v<T, cmd::BindStorageBuffer>) return touches_deferred(v.range.address, v.range.size);
+        else if constexpr (std::is_same_v<T, cmd::CopyBuffer>) return touches_deferred(v.src, v.size) || touches_deferred(v.dst, v.size);
+        else if constexpr (std::is_same_v<T, cmd::ClearBuffer> || std::is_same_v<T, cmd::UpdateBuffer>) return touches_deferred(v.address, v.size);
+        else if constexpr (std::is_same_v<T, cmd::Dispatch>) return touches_deferred(v.indirect, 12);
+        else if constexpr (std::is_same_v<T, cmd::ReportCounter> || std::is_same_v<T, cmd::ReportValue>) return touches_deferred(v.address, 16);
+        else if constexpr (std::is_same_v<T, cmd::RenderEnable>) return touches_deferred(v.counters, 16);
+        else if constexpr (std::is_same_v<T, cmd::CopyBufferToTexture>) return true;
+        else if constexpr (std::is_same_v<T, cmd::Draw>) {
+            const uint64_t record = v.index_type < 0 ? 16 : 20;
+            const auto size = v.draw_count && v.max_draws > 0 ? uint64_t(v.max_draws - 1) * uint32_t(v.stride) + record : record;
+            return touches_deferred(v.indirect, size) || touches_deferred(v.draw_count, 4);
+        } else if constexpr (std::is_same_v<T, cmd::BindProgram>) {
+            if (v.program) for (const auto& s : v.program->stages)
+                if (!s.tried || touches_deferred(s.constants, s.constants_size)) return true;
+        }
+        return false;
+    }, c);
+    return !hit || wait_submit_fence(deferred_submit_.load(std::memory_order_acquire), UINT64_MAX);
+}
+
 void Executor::apply(const Command& c) {
+    if (deferred_failed_.load(std::memory_order_acquire) ||
+        (deferred_submit_.load(std::memory_order_acquire) && !prepare_command_access(c))) {
+        cpu_publication_ok_ = false;
+        return;
+    }
     if (!recording_) begin(); // a CPU visibility fence may have submitted the preceding commands
     cur_command_ = &c;
     if (frame_ == trace_frame_) trace_counts_[c.index()]++;
@@ -4622,6 +4712,11 @@ bool Executor::decode_level(Texture& t, const LevelLayout& lv, const uint8_t* bl
 
 void Executor::upload(Texture& t) {
     if (!t.storage || !t.image) return;
+    if (!before_guest_access(reinterpret_cast<uintptr_t>(t.storage), t.layout.total_size())) {
+        cpu_publication_ok_ = false;
+        t.uploaded = false;
+        return;
+    }
     ++texture_events_;
     LoadTimer timer(*this, kLdUpload, t.layout.total_size());
     if (std::find(frame_uploads_.begin(), frame_uploads_.end(), &t) == frame_uploads_.end()) frame_uploads_.push_back(&t);
@@ -6352,6 +6447,7 @@ bool Executor::prepare_contents(Texture& t, PriorContents prior, bool inspect_gu
     if (__atomic_load_n(&t.mapping_changed, __ATOMIC_ACQUIRE) && !apply_mapping_changes(t)) return false;
     if (!apply_texel_writes(t)) return false;
     if (prior == PriorContents::Replace || t.gpu_levels == size_t{upload_levels(t)} * upload_layers(t)) return true;
+    if (!before_guest_access(reinterpret_cast<uintptr_t>(t.storage), t.layout.total_size())) return false;
     if (inspect_guest || cpu_texture_changed(t)) {
         split_why_ = "subida de textura";
         end_render_pass();
@@ -7661,11 +7757,13 @@ void Executor::maybe_split() {
     // Bastantes draws desde el último envío y el render pass cerrado (o a punto de cerrarse: cambian los render
     // targets): se manda lo grabado y la GPU empieza. Partir con el pass abierto obligaría a guardarlo y cargarlo.
     const bool many_draws = split_ && draws_ - submit_draws_ >= kSplitDraws && (!in_render_pass_ || targets_changed_);
-    if (!staging_full && !cache_full && !many_draws) return;
+    const bool staged = fence_hint_.written && stage_fence_copy();
+    if (!staging_full && !cache_full && !many_draws && !staged) return;
     static int logged = 0;
     if ((staging_full || cache_full) && logged++ < 5)
         NVN_LOG("%s en un envío: se parte\n", staging_full ? "staging lleno" : "caché de vértices llena");
-    split_why_ = many_draws && !staging_full && !cache_full ? "envío partido (draws)" : "envío partido (staging o caché)";
+    split_why_ = staged ? "fence readback" :
+                 many_draws && !staging_full && !cache_full ? "envío partido (draws)" : "envío partido (staging o caché)";
     end_render_pass();
     targets_changed_ = true;
     splitting_ = true;
@@ -7782,7 +7880,7 @@ void Executor::draw(const cmd::Draw& in) {
     std::vector<uint32_t> exact_args;
     uint32_t exact_count = 0;
     if (d.indirect && d.index_type >= 1 && d.index_address) {
-        window = indirect_index_window(d.index_address, multi);
+        window = indirect_index_window(d, args_size);
         if (!window.size) {
             // Without a bounded allocation, only the actual arguments establish which indices
             // can be fetched. Preserve draw IDs and the command order for counted multi-draws.
@@ -8105,6 +8203,7 @@ void Executor::draw(const cmd::Draw& in) {
             }
         }
         if (index_bytes) {
+            if (!before_guest_access(d.index_address, index_bytes)) { cpu_publication_ok_ = false; return; }
             if (const Overlay* o = find_overlay(d.index_address, index_bytes, &gpu_index_offset)) {
                 gpu_index = o->buffer;
             } else if (!gather_overlays(d.index_address, index_bytes, &gpu_index, &gpu_index_offset)) {
@@ -9209,6 +9308,7 @@ const Executor::Mirror* Executor::mirror(uint64_t address, uint64_t size, VkDevi
     m->unread = mirror_batch_;
     if (m->direct) m->version_submit[m->cur] = m->used_submit;
     if (m->checked == submit_index_) return m;
+    if (!before_guest_access(base, m->size)) { cpu_publication_ok_ = false; return nullptr; }
     // Revisión: las páginas que cambiaron (todas la primera vez), en tramos seguidos, por el staging. Vigilado, lo
     // dicen las escrituras que saltaron (y las páginas quedan cerradas antes de copiarlas); si no, el hash.
     std::vector<std::pair<size_t, size_t>> byte_runs;  // (offset, bytes)
@@ -9361,19 +9461,32 @@ bool Executor::pool_range(uint64_t address, uint64_t* start, uint64_t* size) {
     return true;
 }
 
-BufferRange Executor::indirect_index_window(uint64_t address, bool multi) {
+BufferRange Executor::indirect_index_window(const cmd::Draw& draw, uint64_t args_size) {
+    const uint64_t address = draw.index_address;
     uint64_t start = 0, pool_size = 0;
     if (!pool_range(address, &start, &pool_size)) return {};
-    const uint64_t base = multi ? std::max(start, address & ~(kIndexWindowAlign - 1)) : address;
+    const uint64_t base = draw.draw_count ? std::max(start, address & ~(kIndexWindowAlign - 1)) : address;
     const uint64_t size = pool_size - (base - start);
     if (size > kIndexWindow) return {};
     const uint64_t remaining = size - (address - base);
     if (remaining >= kMirrorMin) {
-        // Avoid a megabyte-sized snapshot per draw for a small GPU patch. Resolve the
-        // actual firstIndex/count instead. Clean windows can keep their shared mirror.
         const auto it = first_overlay_touching(address);
         if (it != overlays_.end() && it->first < base + size &&
-            (it->first > address || it->second.size - (address - it->first) < remaining)) return {};
+            (it->first > address || it->second.size - (address - it->first) < remaining)) {
+            // Prefer an exact range when its parameters are already on the host. Otherwise
+            // let the GPU assemble the bounded mixed window and consume its own arguments.
+            // Limit speculative copies to one staging chunk across all draws in this job.
+            auto needs_readback = [&](uint64_t addr, uint64_t len) {
+                const auto part = first_overlay_touching(addr);
+                if (part == overlays_.end() || part->first >= addr + len) return false;
+                return part->second.device_update > index_params_visible_ || part->first > addr ||
+                       part->second.size - (addr - part->first) < len;
+            };
+            if (remaining > kStagingChunk - mixed_index_bytes_ ||
+                !(needs_readback(draw.indirect, args_size) || (draw.draw_count && needs_readback(draw.draw_count, 4))))
+                return {};
+            mixed_index_bytes_ += remaining;
+        }
     }
     return {base, size};
 }
@@ -12247,13 +12360,183 @@ bool Executor::prepare_texel_readback(Texture& t) {
     return apply_texel_writes(t);
 }
 
-bool Executor::publish_virtual_pool(void* key, Texture* only, Visibility visibility) {
+bool Executor::stage_fence_copy() {
+    auto& hint = fence_hint_;
+    if (frame_ - hint.requested > 1) { hint = {}; return false; }
+    if (hint.attempted == frame_) return false;
+    if (in_render_pass_ && (!targets_changed_ || same_targets(st_.rt, cur_pass_rt_) ||
+                            (merge_passes_ && targets_fit(st_.rt, cur_pass_rt_)))) return false;
+    Texture& t = *hint.texture;
+    // Wait for the producer pass to finish. A clear frequently precedes more writes to the same target.
+    if (st_.rt.depth == &t) return false;
+    for (int i = 0; i < st_.rt.count; ++i)
+        if (st_.rt.colors[i] == &t) return false;
+    hint.written = false;
+    if (!t.image || __atomic_load_n(&t.mapping_changed, __ATOMIC_ACQUIRE) || g_texel_writes.load()) return false;
+    const auto pool = virtual_writes_.find(t.desc.pool);
+    if (pool == virtual_writes_.end()) return false;
+    const auto dirty = pool->second.find(&t);
+    if (dirty == pool->second.end()) return false;
+    const auto entry = dirty->second.find({hint.mip, hint.layer});
+    if (entry == dirty->second.end() || !t.owns_level(size_t{hint.layer} * upload_levels(t) + hint.mip)) return false;
+    const auto& lv = t.layout.levels[hint.mip];
+    TexelReadback copy(t, {hint.mip, hint.layer, 1, {0, 0, 0, lv.width_blocks, lv.height_blocks, lv.depth}});
+    if (copy.layer_bytes > kStagingChunk) return false;
+    auto& slot = inflight_[cur_];
+    if (slot.texel_readback.used()) return false;
+    hint.attempted = frame_;
+    const auto a = slot.texel_readback.alloc_contiguous(copy.layer_bytes, 4 * t.layout.bytes_per_block);
+    if (!a.data) {
+        slot.texel_readback.reset(); // a speculative allocation must not prevent the mandatory fence copy from retrying
+        return false;
+    }
+    split_why_ = "fence readback";
+    end_render_pass();
+    flush_clears(&t);
+    note_gpu_work();
+    sync_image(cmd_, t.image, {t.aspect, hint.mip, 1, hint.layer, 1}, prior_writes, transfer_read);
+    copy.record(cmd_, a);
+    sync_memory(cmd_, transfer_read, later_access); // later writes must not overtake this read
+    sync_memory(cmd_, transfer_write, {VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT});
+    slot.fence_copy = {t.serial, t.content_version, entry->second, hint.mip, hint.layer, a.data};
+    return true;
+}
+
+bool Executor::publish_fence_copy(TexelReadback& copy, bool& used) {
+    for (auto& slot : inflight_) {
+        const auto& staged = slot.fence_copy;
+        if (!staged.data || staged.image != copy.texture->serial || staged.version != copy.texture->content_version ||
+            staged.order != copy.order || staged.mip != copy.region.level || staged.layer != copy.region.layer) continue;
+        used = true;
+        if (vkWaitForFences(vk()->device, 1, &slot.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+        copy.data = staged.data;
+        copy.publish();
+        slot.fence_copy = {};
+        slot.texel_readback.reset();
+        slot.texel_readback.trim(0);
+        return true;
+    }
+    return true;
+}
+
+bool Executor::touches_deferred(uint64_t address, uint64_t size) const {
+    if (!address || !size) return false;
+    const auto next = std::upper_bound(deferred_ranges_.begin(), deferred_ranges_.end(), address,
+        [](uint64_t a, const auto& range) { return a < range.first; });
+    if (next != deferred_ranges_.end() && next->first - address < size) return true;
+    return next != deferred_ranges_.begin() && address - std::prev(next)->first < std::prev(next)->second;
+}
+
+bool Executor::before_guest_access(uint64_t address, uint64_t size) {
+    const auto producer = deferred_submit_.load(std::memory_order_acquire);
+    if (deferred_failed_.load(std::memory_order_acquire)) return false;
+    return !producer || !touches_deferred(address, size) || wait_submit_fence(producer, UINT64_MAX);
+}
+
+bool Executor::defer_fence_copy(TexelReadback copy) {
+    auto& t = *copy.texture;
+    if (deferred_copy_ || !t.gpu_only_virtual || t.buffer_overlap || __atomic_load_n(&t.raw_alias, __ATOMIC_ACQUIRE) ||
+        frame_ == trace_frame_ || loading_armed_ || vigilar_nan_) return false;
+    auto* pool = g_memory_pools.get(t.desc.pool);
+    if (!pool || __atomic_load_n(&pool->mapped_by_cpu, __ATOMIC_ACQUIRE)) return false;
+    const auto address = reinterpret_cast<uintptr_t>(t.storage);
+    if (!nnsdk::watch::alias_ranges(address, t.layout.total_size(), deferred_ranges_)) return false;
+    // These may be read implicitly (including page-sized mirror refreshes) before any
+    // new binding is replayed. Retain the synchronous path when ownership overlaps.
+    for (const auto& [base, o] : overlays_) if (touches_deferred(base, o.size)) return false;
+    for (const auto& [base, m] : mirrors_) if (touches_deferred(base, m.size)) return false;
+    for (const auto& r : st_.vertex_buffers) if (touches_deferred(r.address, r.size)) return false;
+    for (const auto& b : st_.bindings) {
+        for (const auto& r : b.uniforms) if (touches_deferred(r.address, r.size)) return false;
+        for (const auto& r : b.storage) if (touches_deferred(r.address, r.size)) return false;
+    }
+    for (const auto* stage : st_.stages)
+        if (stage && touches_deferred(stage->constants, stage->constants_size)) return false;
+    if (st_.compute && touches_deferred(st_.compute->constants, st_.compute->constants_size)) return false;
+    {
+        std::lock_guard wb(wb_mutex_);
+        for (const auto& w : pending_wb_) if (touches_deferred(w.address, w.size)) return false;
+    }
+    bool alias = false;
+    g_textures.for_each([&](Texture& other) {
+        if (&other != &t && touches_deferred(reinterpret_cast<uintptr_t>(other.storage), other.layout.total_size())) alias = true;
+    });
+    if (alias) return false;
+    std::lock_guard lock(fence_mutex_);
+    for (const auto& f : inflight_)
+        if (f.pending)
+            for (const auto& stamp : f.stamps) if (touches_deferred(stamp.address, 16)) return false;
+    for (auto& f : inflight_) {
+        const auto& s = f.fence_copy;
+        if (!s.data || s.image != t.serial || s.version != t.content_version || s.order != copy.order ||
+            s.mip != copy.region.level || s.layer != copy.region.layer) continue;
+        if (f.submit <= completed_.load(std::memory_order_relaxed)) return false;
+        copy.data = s.data;
+        deferred_copy_ = copy;
+        deferred_submit_.store(f.submit, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+void Executor::fail_deferred(uint64_t through) {
+    const auto producer = deferred_submit_.load(std::memory_order_relaxed);
+    if (!producer || producer > through) return;
+    deferred_failed_ = true;
+    sync_fail_at(deferred_sync_, deferred_ticket_);
+    deferred_submit_.store(0, std::memory_order_release);
+    NVN_LOG("texture fence readback failed for submit %llu\n", static_cast<unsigned long long>(producer));
+}
+
+bool Executor::retire_fence_copy(bool wait) {
+    if (!deferred_copy_) return true;
+    if (const auto submit = deferred_submit_.load(std::memory_order_acquire)) {
+        if (!wait) return true;
+        if (!wait_submit_fence(submit, UINT64_MAX)) return false;
+    }
+    const auto& c = *deferred_copy_;
+    if (deferred_failed_) {
+        // Keep the level and its physical mappings dirty for a subsequent retry.
+        for (auto& f : inflight_) if (f.fence_copy.order == c.order && f.fence_copy.data == c.data) f.fence_copy = {};
+        deferred_copy_.reset();
+        return true;
+    }
+    auto pool = virtual_writes_.find(c.texture->desc.pool);
+    if (pool != virtual_writes_.end()) {
+        auto image = pool->second.find(c.texture);
+        if (image != pool->second.end()) {
+            auto& dirty = image->second;
+            auto level = dirty.find({c.region.level, c.region.layer});
+            if (level != dirty.end() && level->second == c.order) dirty.erase(level);
+            if (dirty.empty()) pool->second.erase(image);
+        }
+        if (pool->second.empty()) {
+            auto* p = g_memory_pools.get(pool->first);
+            std::lock_guard mapping(p->mapping_mutex);
+            p->gpu_dirty = false;
+            virtual_writes_.erase(pool);
+        }
+    }
+    deferred_copy_.reset();
+    virtual_pending_.store(!virtual_writes_.empty(), std::memory_order_release);
+    return true;
+}
+
+bool Executor::publish_virtual_pool(void* key, Texture* only, Visibility visibility, void* sync, uint64_t ticket) {
     if (!virtual_pending_.load(std::memory_order_acquire)) return true;
     std::lock_guard lock(g_mutex);
+    if (!retire_fence_copy(visibility != Visibility::Submission)) return false;
+    const bool retry = deferred_failed_.load(std::memory_order_acquire);
+    if (retry) {
+        key = nullptr;
+        only = nullptr;
+        visibility = Visibility::Storage;
+    }
     auto first = key ? virtual_writes_.find(key) : virtual_writes_.begin();
     if (first == virtual_writes_.end()) return true;
     const auto last = key ? std::next(first) : virtual_writes_.end();
     std::vector<TexelReadback> copies;
+    const bool standalone_fence = (visibility == Visibility::CpuFence || visibility == Visibility::QueueFence) && !recording_;
     std::vector<std::pair<void*, Texture*>> published;
     for (auto pool = first; pool != last; ++pool) {
         // gpu_dirty pins these mappings until the entire batch has reached guest memory.
@@ -12275,7 +12558,10 @@ bool Executor::publish_virtual_pool(void* key, Texture* only, Visibility visibil
                     (backing && !backing->has_cpu_backing(t->desc.offset, t->layout.total_size())))) continue;
             }
             published.emplace_back(pool->first, t);
-            if (!prepare_texel_readback(*t)) { finish(); return false; }
+            if (!standalone_fence || !pending_clears_.empty() || g_texel_writes.load() ||
+                __atomic_load_n(&t->mapping_changed, __ATOMIC_ACQUIRE)) {
+                if (!prepare_texel_readback(*t)) { finish(); return false; }
+            }
             const uint32_t levels = upload_levels(*t);
             for (auto it = dirty.begin(); it != dirty.end();) {
                 const auto [subresource, order] = *it++;
@@ -12293,10 +12579,32 @@ bool Executor::publish_virtual_pool(void* key, Texture* only, Visibility visibil
             }
         }
     }
-    if (published.empty()) return true;
+    if (published.empty()) return !retry;
     // Different virtual images can cover the same physical bytes.
     std::stable_sort(copies.begin(), copies.end(), [](const auto& a, const auto& b) { return a.order < b.order; });
-    if (!readback_texels(copies)) return false;
+    bool used = false;
+    const bool predictable = standalone_fence && !recording_ && copies.size() == 1 && copies.front().region.layers == 1;
+    if (visibility == Visibility::QueueFence) {
+        deferred_sync_ = sync;
+        deferred_ticket_ = ticket;
+    }
+    if (predictable && visibility == Visibility::QueueFence && published.size() == 1 && defer_fence_copy(copies.front())) {
+        const auto& c = copies.front();
+        fence_hint_ = {c.texture, c.region.level, c.region.layer, frame_};
+        return true;
+    }
+    if (!copies.empty() && deferred_submit_.load(std::memory_order_acquire) &&
+        !wait_submit_fence(deferred_submit_.load(), UINT64_MAX)) return false;
+    if (predictable && !publish_fence_copy(copies.front(), used)) return false;
+    if (!used && !readback_texels(copies)) return false;
+    if (standalone_fence) {
+        if (predictable) {
+            const auto& copy = copies.front();
+            fence_hint_ = {copy.texture, copy.region.level, copy.region.layer, frame_};
+        } else {
+            fence_hint_ = {};
+        }
+    }
     finish(); // preparation can release the last image-owned mip
     for (const auto& [pool_key, texture] : published) {
         auto it = virtual_writes_.find(pool_key);
@@ -12309,6 +12617,7 @@ bool Executor::publish_virtual_pool(void* key, Texture* only, Visibility visibil
         virtual_writes_.erase(it);
     }
     virtual_pending_.store(!virtual_writes_.empty(), std::memory_order_release);
+    if (retry) deferred_failed_.store(false, std::memory_order_release);
     return true;
 }
 
@@ -12377,6 +12686,7 @@ bool Executor::readback_texels(std::vector<TexelReadback>& copies) {
         }
         for (; first < stop; ++first) copies[first].publish();
         // The fence and host copies are complete. Other slots can reuse these cached blocks.
+        slot.fence_copy = {};
         slot.texel_readback.reset();
         slot.texel_readback.trim(0);
     }
@@ -12385,6 +12695,7 @@ bool Executor::readback_texels(std::vector<TexelReadback>& copies) {
 
 bool Executor::sync_texture_storage(Texture& t, const Texture::TexelWrite& r) {
     std::lock_guard lock(g_mutex);
+    if (!before_guest_access(reinterpret_cast<uintptr_t>(t.storage), t.layout.total_size())) return false;
     const uint32_t levels = upload_levels(t);
     auto owned = [&](uint32_t layer) { return t.owns_level(size_t{layer} * levels + r.level); };
     uint32_t start = r.layer;
@@ -12631,7 +12942,7 @@ private:
         done_cv_.wait(lock, [&] { return jobs_.empty() && !busy_; });
     }
     void run(const std::vector<const CommandList*>& lists, uint64_t ticket, void* host_sync) {
-        const bool ok = host_sync ? g_executor.publish_virtual_pool(nullptr, nullptr, Executor::Visibility::CpuFence)
+        const bool ok = host_sync ? g_executor.publish_virtual_pool(nullptr, nullptr, Executor::Visibility::QueueFence, host_sync, ticket)
                                   : g_executor.run(lists);
         if (!ok) {
             if (host_sync) sync_fail_at(host_sync, ticket);
@@ -12713,6 +13024,9 @@ void capture_loading_present(ResourceRef<Texture> presented, const VkRect2D& cro
 uint64_t last_submit() { return g_submit_queue.last_ticket(); }
 std::recursive_mutex& executor_mutex() { return g_mutex; }
 bool publish_virtual_pool(void* pool, Texture* only) { return g_executor.publish_virtual_pool(pool, only); }
+bool before_guest_texture_access(const void* data, size_t size) {
+    return g_executor.guest_access_from_api(reinterpret_cast<uintptr_t>(data), size);
+}
 bool publish_virtual_buffers(void* pool) {
     return g_executor.publish_virtual_pool(pool, nullptr, Executor::Visibility::Buffer);
 }

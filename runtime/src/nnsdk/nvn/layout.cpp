@@ -275,11 +275,21 @@ void deswizzle_level_v1(const LevelLayout& level, uint32_t bpb, const uint8_t* s
 void swizzle_region(const LevelLayout& level, uint32_t bpb, const BlockBox& box, const uint8_t* src, size_t row_pitch,
                     size_t slice_pitch, uint8_t* tiled) {
     const uint32_t left = box.x * bpb, width = box.width * bpb;
-    if (left % kGobWidth == 0 && width % kGobWidth == 0 &&
-        box.y % kGobHeight == 0 && box.height % kGobHeight == 0) {
+    const uint32_t first = (kGobHeight - box.y % kGobHeight) % kGobHeight;
+    if (left % kGobWidth == 0 && width % kGobWidth == 0 && box.height >= first + kGobHeight) {
+        const uint32_t stop = box.height - (box.height - first) % kGobHeight;
+        auto copy_edge = [&](uint32_t y, uint32_t height) {
+            if (!height) return;
+            BlockBox edge = box;
+            edge.y += y;
+            edge.height = height;
+            copy_box<true>(level, bpb, edge, tiled, const_cast<uint8_t*>(src + size_t{y} * row_pitch),
+                           row_pitch, slice_pitch);
+        };
+        copy_edge(0, first);
         const Swizzle s(level, bpb);
         for (uint32_t z = 0; z < box.depth; ++z) {
-            for (uint32_t y = 0; y < box.height; y += kGobHeight) {
+            for (uint32_t y = first; y < stop; y += kGobHeight) {
                 const uint8_t* rows = src + z * slice_pitch + y * row_pitch;
                 uint8_t* gob = tiled + s.row(box.y + y, box.z + z) + s.column(left);
                 for (uint32_t x = 0; x < width; x += kGobWidth, gob += s.block_size) {
@@ -300,6 +310,7 @@ void swizzle_region(const LevelLayout& level, uint32_t bpb, const BlockBox& box,
                 }
             }
         }
+        copy_edge(stop, box.height - stop);
         return;
     }
     copy_box<true>(level, bpb, box, tiled, const_cast<uint8_t*>(src), row_pitch, slice_pitch);
