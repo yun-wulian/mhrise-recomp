@@ -61,8 +61,9 @@ the A725.
 
 To read a PGM or PPM, any image viewer works, or `PIL.Image.open()` in Python. Depth is reversed Z, so near is bright.
 
-**NPC face NaNs (pixel shader `c87ca93efba78188`).** A full frame capture instruments matching HDR draws for that
-frame only. Each `face-f<frame>-d<draw>.raw` is the scene colour immediately after that draw; the matching `.spv`
+**NPC face NaNs (pixel shader `c87ca93efba78188`).** To opt into this diagnostic for one frame, write `face_nan`
+to `<data>/trazar`. Ordinary full captures use the original face shader. The dedicated capture instruments matching
+HDR draws. Each `face-f<frame>-d<draw>.raw` is the scene colour immediately after that draw; the matching `.spv`
 is the original fragment module. A fragment with a nonfinite RGB export encodes its first observed nonfinite input,
 sample, division or selected math result. Result 0 means none of those checkpoints saw it. A checkpoint can belong
 to a calculation whose value was later discarded. Inspect a known affected face pixel before interpreting the frame
@@ -70,7 +71,7 @@ histogram (other draws also occupy this target). Run `python tools/read_face_pro
 render-target coordinates, then `spirv-dis --raw-id <spv>` to look up the result ID. The log records matched draws
 and successful readbacks. The captured image can show bright diagnostic pixels for that frame.
 
-For the normal-packing compute shader `525985a9ccdd7b21`, a full capture also saves the guest and Vulkan
+For the normal-packing compute shader `525985a9ccdd7b21`, the same `face_nan` capture also saves the guest and Vulkan
 views of the vertex remap as `normal-remap-f<frame>-cs<dispatch>.{guest,gpu}.bin`. Its S1 input has one
 little-endian 32-bit word per vertex. The low 22 bits select a 12-byte entry in S0. The `normal remap` log
 line gives the guest address, binding source and buffer sizes for that dispatch.

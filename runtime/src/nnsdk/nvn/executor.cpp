@@ -1294,7 +1294,9 @@ private:
     static constexpr int kCounterTimestamp = 0;
     uint64_t samples_passed_ = 0;
     uint64_t watch_addr_ = 0;
-    bool full_trace_ = false;  // DEPURACIÓN: la traza pedida vuelca también los render targets
+    enum class TraceMode { Basic, Full, FaceNaN };
+    TraceMode trace_mode_ = TraceMode::Basic;
+    bool tracing_face() const { return frame_ == trace_frame_ && trace_mode_ == TraceMode::FaceNaN; }
     struct PrepassArgs {
         uint64_t indices;
         uint32_t count;
@@ -8429,7 +8431,7 @@ void Executor::draw(const cmd::Draw& in) {
         }
     }
     VkPipeline p = VK_NULL_HANDLE;
-    if (frame_ == trace_frame_ && full_trace_) {
+    if (tracing_face()) {
         const auto* fs = st_.stages[static_cast<int>(Stage::Fragment)];
         if (fs && fs->print == kFacePixelShader && st_.rt.count && st_.rt.colors[0] &&
             st_.rt.colors[0]->vk_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
@@ -10601,7 +10603,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     // DEPURACIÓN: la huella se gasta aunque ya se esté trazando este frame (si no, dispararía otra traza en otra carga).
     if (trace_on_print_ && cs && trace_on_print(cs->print) && frame_ != trace_frame_) {
         trace_frame_ = frame_;
-        full_trace_ = trace_prints_full_;
+        trace_mode_ = trace_prints_full_ ? TraceMode::Full : TraceMode::Basic;
         traced_draws_ = 0;
         memset(trace_counts_, 0, sizeof trace_counts_);
         NVN_LOG("traza del frame %llu desde el dispatch %llu (compute %016llx, de trace_print)\n",
@@ -10777,7 +10779,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     const VkDeviceSize ssbo_align = std::max<VkDeviceSize>(limits.minStorageBufferOffsetAlignment, 16);
     std::vector<std::pair<uint64_t, uint64_t>> read_ranges;  // DEPURACIÓN (read_after_dispatch): overlays a leer
     VkDescriptorBufferInfo face_remap{};
-    const bool trace_face_remap = full_trace_ && frame_ == trace_frame_ && cs->print == 0x525985a9ccdd7b21ULL;
+    const bool trace_face_remap = tracing_face() && cs->print == 0x525985a9ccdd7b21ULL;
     const std::string remap_file = trace_face_remap ? "/storage/emulated/0/NieR-volcados/normal-remap-f" +
         std::to_string(frame_) + "-cs" + std::to_string(dispatches_) : std::string{};
     std::vector<ReadInput> read_inputs;
@@ -12293,11 +12295,16 @@ void Executor::dump_frame(Texture* presented) {
         prepass_args_.clear();
         // DEPURACIÓN: solo la imagen final y el log, salvo con <datos>/full_trace
         const char* light = NVN_FLAG("full_trace") ? nullptr : getenv("NIER_TRAZA_LIGERA");
-        for (size_t k = 0; k < frame_targets_.size() && k < 32 && (full_trace_ || !(light && *light)); k++)
+        for (size_t k = 0; k < frame_targets_.size() && k < 32 && (trace_mode_ != TraceMode::Basic || !(light && *light)); k++)
             dump(*frame_targets_[k], "f" + f + "_rt" + std::to_string(k));
     }
+    if (tracing_face()) {
+        NVN_LOG("face probe: frame %llu, matched %u, saved %u\n",
+                static_cast<unsigned long long>(frame_), face_probe_matches_, face_probe_saved_);
+        face_probe_matches_ = face_probe_saved_ = 0;
+    }
     if (const int asked = g_trace_request.exchange(0, std::memory_order_relaxed)) {  // request_trace (detector)
-        full_trace_ = asked == 2;
+        trace_mode_ = asked == 2 ? TraceMode::Full : TraceMode::Basic;
         trace_frame_ = frame_ + 1;
         traced_draws_ = 0;
         memset(trace_counts_, 0, sizeof trace_counts_);
@@ -12317,11 +12324,13 @@ void Executor::dump_frame(Texture* presented) {
                 fclose(f);
             }
             unlink(flag.c_str());
-            if (std::string_view(mode, strcspn(mode,"\r\n")) == "loading_iam") {
+            const std::string_view request(mode, strcspn(mode, "\r\n"));
+            if (request == "loading_iam") {
                 loading_armed_ = true;
                 NVN_LOG("armed loading illustration capture\n");
             } else {
-                full_trace_ = strstr(mode, "completa") != nullptr;
+                trace_mode_ = strstr(mode, "completa") ? TraceMode::Full : TraceMode::Basic;
+                if (request == "face_nan") trace_mode_ = TraceMode::FaceNaN;
                 trace_frame_ = frame_ + 1;
                 traced_draws_ = 0;
                 memset(trace_counts_, 0, sizeof trace_counts_);
@@ -12335,9 +12344,6 @@ void Executor::dump_frame(Texture* presented) {
     }
     if (frame_ == trace_frame_) {
         std::string counts;
-        if (full_trace_) NVN_LOG("face probe: frame %llu, matched %u, saved %u\n",
-            static_cast<unsigned long long>(frame_), face_probe_matches_, face_probe_saved_);
-        face_probe_matches_ = face_probe_saved_ = 0;
         for (size_t k = 0; k < std::size(trace_counts_); k++)
             if (trace_counts_[k]) counts += " " + std::to_string(k) + ":" + std::to_string(trace_counts_[k]);
         NVN_LOG("F comandos del frame (índice del variant:cuenta):%s; draws con render desactivado %llu\n", counts.c_str(),
